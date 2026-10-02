@@ -17,13 +17,24 @@ STREAM_PARTIAL_TEXT writeback) runs for real.
 Regressions pinned (maintainer review of PR #7978):
 
   1. events 404 after a partial stream + durable status ``interrupted``
-     -> the turn does NOT succeed with the partial text (Fix 1).
+      -> the turn does NOT succeed with the partial text (Fix 1).
   2. status 503 during the stream while the stream later delivers
-     ``run.completed`` -> the turn completes with the full answer, the probe
-     budget is not exhausted, and Stop is honoured mid-way (Fix 2).
+      ``run.completed`` -> the turn completes with the full answer, the probe
+      budget is not exhausted, and Stop is honoured mid-way (Fix 2).
   3. completed status carrying a longer output than the streamed text
-     -> the adopted output is the status output, in both settle paths
-     (Fix 3), while an empty status output keeps the streamed text.
+      -> the adopted output is the status output, in both settle paths
+      (Fix 3), while an empty status output keeps the streamed text.
+
+Round-2 review regressions pinned (2026-10-02):
+
+  4. socket reset after a partial delta -> events reconnect 404 -> status 404
+      -> the turn fails closed within <= 2 status probes and ZERO
+      poll-interval waits (a lost run must not spin the turn for the full
+      ~298s reattach budget); the same rule holds for a bare status 404.
+  5. the 404 grace is small and non-eager: a single 404 followed by
+      ``running`` still lets the run complete, and a 404 interrupted by a
+      503 restarts the streak (only CONSECUTIVE 404s are terminal) while
+      the 503 alone keeps spending the long budget.
 
 Runs under pytest on supported interpreters and standalone on Python 3.14
 (``python3 tests/test_gateway_events_watchdog_7978.py``), where the repo
@@ -277,6 +288,126 @@ def test_events_404_after_partial_stream_interrupted_status_does_not_settle_part
     assert any("interrupted" in reason for reason in harness["settles"])
 
 
+# ------------------------------------------------- round-2 review: 404 ----
+
+
+def test_events_404_then_status_404_fails_closed_within_two_probes():
+    """Round-2 (maintainer-timed scenario): socket reset after a partial
+    delta -> events reconnect 404 -> durable status 404 -> the turn must fail
+    closed within <= 2 status probes and ZERO poll-interval waits, not spin
+    the full ~298s reattach budget. Asserted on fake-clock steps, not just
+    the outcome."""
+    harness = run_turn(
+        urlopen_script=[
+            partial_delta("Hello", seq=0),   # partial text, then socket reset
+            _http_error(404),                # reconnect: gateway has no run
+            _http_error(404),                # grace re-probe's reconnect: still no run
+        ],
+        status_script=[
+            _http_error(404),                # probe 1: definitive "no record of this run"
+            _http_error(404),                # probe 2 (grace): terminal
+        ],
+    )
+
+    raised = harness["result"]
+    assert isinstance(raised, RuntimeError), f"expected fail-closed raise, got {raised!r}"
+    assert "no longer has the run" in str(raised)
+    # Timing proof: exactly the grace probes ran, and none of them slept a
+    # poll interval — the pre-fix branch spent 150 probes / 298.0s here.
+    assert harness["status"].calls == 2
+    assert harness["clock"].now == 0.0, (
+        f"grace probes must not sleep the poll interval, spent {harness['clock'].now}s")
+    assert harness["clock"].now < 2 * GATEWAY_REATTACH_POLL_INTERVAL
+    # Partial streamed text was never settled as success.
+    assert harness["settles"] == []
+    # The grace re-probe still reconnected events with the Last-Event-ID cursor.
+    assert harness["urlopen"].header(1, "Last-Event-ID") == "0"
+
+
+def test_bare_status_404_grace_second_consecutive_404_fails_closed():
+    """Round-2: a status 404 is terminal after the small grace even without an
+    events failure in the picture: first 404 -> one immediate re-probe (no
+    sleep), second consecutive 404 -> fail closed. Pre-fix this scenario
+    spent the full 150-probe budget."""
+    harness = run_turn(
+        urlopen_script=[
+            FakeSseResponse(
+                sse_frame(0, {"event": "message.delta", "delta": "Hello"}), end="eof"),
+            _http_error(404),                # grace re-probe's reconnect
+        ],
+        status_script=[
+            _http_error(404),                # probe 1
+            _http_error(404),                # probe 2 (grace): terminal
+        ],
+    )
+
+    raised = harness["result"]
+    assert isinstance(raised, RuntimeError), f"expected fail-closed raise, got {raised!r}"
+    assert "no longer has the run" in str(raised)
+    assert harness["status"].calls == 2
+    assert harness["clock"].now == 0.0, (
+        f"grace probes must not sleep the poll interval, spent {harness['clock'].now}s")
+    assert harness["settles"] == []
+
+
+def test_status_404_grace_does_not_false_positive_on_live_run():
+    """Round-2 grace safety: one status 404 followed by a 200 ``running``
+    resets the streak — the run keeps going and completes normally, proving
+    the grace is not overeager."""
+    harness = run_turn(
+        urlopen_script=[
+            partial_delta("Hello", seq=0),   # partial text, then socket reset
+            _http_error(404),                # grace re-probe's reconnect
+            FakeSseResponse(
+                keepalive()
+                + sse_frame(1, {"event": "run.completed", "output": "Hello world"}),
+                end="eof",
+            ),
+        ],
+        status_script=[
+            _http_error(404),                # probe 1: registration race / blip
+            {"status": "running"},           # probe 2 (grace): run is alive -> streak reset
+        ],
+    )
+
+    result = harness["result"]
+    assert result[0] == "Hello world", f"live run must still complete, got {result!r}"
+    # Probe 1 = 404 (streak 1), probe 2 = running (streak reset); the run then
+    # completes on the events stream with no further probing.
+    assert harness["status"].calls == 2
+    # Exactly one poll-interval wait: the events-unreachable pacing after the
+    # ``running`` probe. The 404 grace itself slept nothing.
+    assert harness["clock"].now == GATEWAY_REATTACH_POLL_INTERVAL
+
+
+def test_status_404_streak_requires_consecutive_404s():
+    """Round-2: only CONSECUTIVE 404s are terminal — a 503 between two 404s
+    restarts the streak (and still spends the long budget); 404s themselves
+    never sleep the poll interval."""
+    harness = run_turn(
+        urlopen_script=[
+            FakeSseResponse(
+                sse_frame(0, {"event": "message.delta", "delta": "Hello"}), end="eof"),
+            _http_error(404),                # reconnect after 404 #1
+            _http_error(404),                # reconnect after the 503
+            _http_error(404),                # reconnect after 404 #2 (grace)
+        ],
+        status_script=[
+            _http_error(404),                # probe 1: streak = 1, immediate re-probe
+            _http_error(503),                # probe 2: transient -> streak reset, budget spent
+            _http_error(404),                # probe 3: streak = 1 again
+            _http_error(404),                # probe 4: streak = 2 -> terminal
+        ],
+    )
+
+    raised = harness["result"]
+    assert isinstance(raised, RuntimeError), f"expected fail-closed raise, got {raised!r}"
+    assert "no longer has the run" in str(raised)
+    assert harness["status"].calls == 4
+    # Only the 503 consumed a poll interval; neither 404 slept.
+    assert harness["clock"].now == GATEWAY_REATTACH_POLL_INTERVAL
+
+
 # --------------------------------------------------------------- Fix 2 -----
 
 
@@ -365,10 +496,11 @@ def test_stop_is_honoured_between_probe_retries():
     assert status.calls == 1, "no further probes after Stop"
 
 
-def test_probe_budget_exhaustion_transient_vs_hard_negative():
+def test_probe_budget_exhaustion_transient_errors_only():
     """Fix 2 give-up condition: the reattach budget (150 consecutive probe
-    failures) is the only give-up; a 404 status is the hard negative that
-    fails closed, transient errors fail as unreachable."""
+    failures) applies to TRANSIENT failures only — a 404 status is exempt and
+    terminal after the small grace (pinned by the round-2 tests above), so
+    the long budget cannot be spent on a lost run."""
     # Transient: 150 consecutive 503s -> "unreachable" RuntimeError; every
     # events reconnect in between also 404s (gateway is unhealthy).
     harness = run_turn(
@@ -383,17 +515,6 @@ def test_probe_budget_exhaustion_transient_vs_hard_negative():
     # The fake clock scaled the budget: one poll interval per failed probe.
     assert harness["clock"].now >= (
         GATEWAY_REATTACH_MAX_POLL_FAILURES - 1) * GATEWAY_REATTACH_POLL_INTERVAL
-
-    # Hard negative: 150 consecutive status 404s -> fail closed per Fix 1
-    # (restart + reap); the partial streamed text is never settled as success.
-    harness = run_turn(
-        urlopen_script=[partial_delta("Hel", seq=0)]
-        + [_http_error(404)] * (GATEWAY_REATTACH_MAX_POLL_FAILURES - 1),
-        status_script=[_http_error(404)] * GATEWAY_REATTACH_MAX_POLL_FAILURES,
-    )
-    raised = harness["result"]
-    assert isinstance(raised, RuntimeError), f"expected fail-closed raise, got {raised!r}"
-    assert "no longer has the run" in str(raised)
 
 
 # --------------------------------------------------------------- Fix 3 -----
@@ -492,9 +613,13 @@ def test_completed_status_empty_output_keeps_streamed_text():
 def main():
     tests = [
         test_events_404_after_partial_stream_interrupted_status_does_not_settle_partial_text,
+        test_events_404_then_status_404_fails_closed_within_two_probes,
+        test_bare_status_404_grace_second_consecutive_404_fails_closed,
+        test_status_404_grace_does_not_false_positive_on_live_run,
+        test_status_404_streak_requires_consecutive_404s,
         test_status_503_during_stream_does_not_kill_live_run,
         test_stop_is_honoured_between_probe_retries,
-        test_probe_budget_exhaustion_transient_vs_hard_negative,
+        test_probe_budget_exhaustion_transient_errors_only,
         test_completed_status_output_preferred_over_streamed_text,
         test_completed_status_stream_writeback_overwrites_partial_text,
         test_completed_status_empty_output_keeps_streamed_text,

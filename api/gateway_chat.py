@@ -722,8 +722,14 @@ def _run_gateway_runs_api_streaming(
     #   failed                 -> raise with the status error
     #   cancelled/interrupted  -> surface cancellation; partial streamed text
     #                             is never settled as success
-    #   unknown run / status
-    #   unavailable            -> fail closed once the reattach budget is
+    #   status 404 (unknown
+    #   run)                   -> terminal after a tiny grace for the status-
+    #                             before-registration race: two consecutive
+    #                             404s with only an immediate re-probe (no
+    #                             poll-interval sleep) between them fail the
+    #                             turn closed (round-2 review)
+    #   status unavailable
+    #   (5xx / transport)      -> fail closed once the reattach budget is
     #                             exhausted (Fix 2); still-running reconnects
     #                             the events stream with Last-Event-ID and
     #                             skips replayed frames.
@@ -731,13 +737,17 @@ def _run_gateway_runs_api_streaming(
     # (GATEWAY_REATTACH_MAX_POLL_FAILURES / GATEWAY_REATTACH_POLL_INTERVAL) so a
     # transient status blip cannot kill a run that is alive and streaming
     # (Fix 2); Stop is honoured between attempts and the events stream keeps
-    # reconnecting between probe rounds.
+    # reconnecting between probe rounds. A durable-status 404 is exempt from
+    # that budget: it is the gateway's definitive "no record of this run"
+    # (unlike a transport error or 5xx, where the run may still be alive), so
+    # it must not spin the turn for ~5 minutes (round-2 review).
     _WATCHDOG_SECS = 120.0
     from api.route_approvals import settle_gateway_pending_run
     last_event_id = -1
     pending_seq: int | None = None
     terminal_seen = False
     probe_failures = 0
+    status_404_streak = 0
 
     def _settle_by_status(status: dict):
         """Decide the turn from the durable run status (Fix 1: the only success
@@ -956,14 +966,25 @@ def _run_gateway_runs_api_streaming(
                 raise RuntimeError(
                     f"Gateway rejected the WebUI credentials (HTTP {exc.code}) while polling run {run_id}"
                 ) from exc
-            probe_failures += 1
-            if probe_failures >= GATEWAY_REATTACH_MAX_POLL_FAILURES:
-                if exc.code == 404:
-                    # Hard negative (restart + reap): fail closed per Fix 1 —
-                    # partial streamed text is never promoted to success.
+            if exc.code == 404:
+                # Terminal, not retryable (round-2 review): a durable-status
+                # 404 is the gateway's definitive "I have no record of this
+                # run", so it must not spend the long reattach budget that
+                # exists for transport errors and 5xx (where the run may
+                # still be alive). Only a small grace guards the status-
+                # before-registration race: the first 404 is re-probed
+                # immediately — no poll-interval sleep — and a second
+                # consecutive 404 fails the turn closed. Any non-404 probe
+                # outcome resets the streak; Stop is honoured at the loop top.
+                status_404_streak += 1
+                if status_404_streak >= _STATUS_404_GRACE_PROBES:
                     raise RuntimeError(
                         "Gateway no longer has the run; failing the turn rather "
                         "than settling partial streamed output") from exc
+                continue
+            probe_failures += 1
+            status_404_streak = 0
+            if probe_failures >= GATEWAY_REATTACH_MAX_POLL_FAILURES:
                 raise RuntimeError(
                     "Gateway became unreachable while waiting for the run to finish") from exc
             # Fix 2: a probe failure is not proof the run is gone. Wait out the
@@ -973,12 +994,14 @@ def _run_gateway_runs_api_streaming(
             continue
         except (urllib.error.URLError, OSError, ValueError) as exc:
             probe_failures += 1
+            status_404_streak = 0
             if probe_failures >= GATEWAY_REATTACH_MAX_POLL_FAILURES:
                 raise RuntimeError(
                     "Gateway became unreachable while waiting for the run to finish") from exc
             cancel_event.wait(GATEWAY_REATTACH_POLL_INTERVAL)
             continue
         probe_failures = 0
+        status_404_streak = 0
         action, value = _settle_by_status(status)
         if action == "continue":
             # Still running: reconnect and resume from the last seen event id,
@@ -1031,6 +1054,11 @@ _GATEWAY_RUN_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", 
 GATEWAY_REATTACH_POLL_INTERVAL = 2.0
 # Consecutive unreachable polls tolerated before the reattached turn is failed (~5 min at 2s).
 GATEWAY_REATTACH_MAX_POLL_FAILURES = 150
+# Consecutive durable-status 404s tolerated inside the streaming watchdog
+# before the turn fails closed: a 404 is terminal (round-2 review); the extra
+# probe only covers a status-before-registration race, and the re-probe runs
+# immediately with no poll-interval sleep.
+_STATUS_404_GRACE_PROBES = 2
 _REATTACH_SCAN_HEAD_BYTES = 16 * 1024
 
 
