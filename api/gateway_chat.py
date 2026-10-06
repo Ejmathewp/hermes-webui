@@ -966,6 +966,8 @@ def _run_gateway_runs_api_streaming(
                 logger.debug("Failed to build runs-API multimodal attachment payload", exc_info=True)
                 message_content = str(msg_text or "")
         from api.streaming import (
+            _active_turn_authority,
+            _active_turn_token_matches,
             _is_non_replayable_history_row,
             _is_reasoning_only_assistant_message,
             _recovered_user_row_is_kept,
@@ -976,9 +978,26 @@ def _run_gateway_runs_api_streaming(
         conversation_history = []
         # (role, content, recovered) for each session row that may be sent.
         history_rows = []
+        # The active turn's retained user row (regeneration restamps it with
+        # this stream's token at chat-start) is re-sent as `input` below;
+        # sending it in conversation_history too makes the gateway see the
+        # prompt twice (re-gate 2026-10-05 item 3). The reconciled partial of
+        # that same interrupted turn is dropped with it.
+        active_turn_identity = _active_turn_authority(session, stream_id, msg_text)
+        drop_reconciled_partial = False
         for entry in getattr(session, "context_messages", None) or []:
             if not isinstance(entry, dict):
                 continue
+            if _active_turn_token_matches(entry, active_turn_identity):
+                drop_reconciled_partial = True
+                continue
+            if (
+                drop_reconciled_partial
+                and entry.get("role") == "assistant"
+                and entry.get(_GATEWAY_CANCEL_RECONCILED_STREAM_KEY)
+            ):
+                continue
+            drop_reconciled_partial = False
             # The same rows the legacy path drops: error markers, empty partials
             # and reasoning-only assistant rows.
             if _is_non_replayable_history_row(entry) or _is_reasoning_only_assistant_message(entry):
@@ -1881,7 +1900,40 @@ def _project_transcript_context_rows(messages) -> list:
     return rows
 
 
-def _reconcile_gateway_cancelled_context(session, stream_id, *, partial_text=None) -> bool:
+def _drop_active_turn_rows_for_writeback(rows, active_turn_identity) -> list:
+    """Remove the active turn's retained rows from a model-context snapshot.
+
+    The regeneration start restamps the retained interrupted-turn user row
+    with the NEW stream's active-turn token while the same prompt is also
+    sent as ``input``. Keeping the row in the snapshot duplicates the prompt:
+    once in the outbound conversation_history, once more when the success
+    writeback appends the freshly materialized user row (re-gate 2026-10-05
+    item 3). The reconciled partial of the SAME interrupted turn — stamped
+    with the cancel-reconciliation key — is dropped with it: the turn is
+    being re-run wholesale, so a partial of the answer it is about to
+    regenerate must not ride along.
+    """
+    from api.streaming import _active_turn_token_matches
+
+    kept = []
+    drop_reconciled_partial = False
+    for row in rows:
+        if _active_turn_token_matches(row, active_turn_identity):
+            drop_reconciled_partial = True
+            continue
+        if (
+            drop_reconciled_partial
+            and isinstance(row, dict)
+            and row.get("role") == "assistant"
+            and row.get(_GATEWAY_CANCEL_RECONCILED_STREAM_KEY)
+        ):
+            continue
+        drop_reconciled_partial = False
+        kept.append(row)
+    return kept
+
+
+def _reconcile_gateway_cancelled_context(session, stream_id, *, partial_text=None, partial_ts=None) -> bool:
     """Mirror an interrupted gateway turn into the model-facing context.
 
     Called when a gateway run settles cancelled/interrupted so WebUI's
@@ -1916,6 +1968,7 @@ def _reconcile_gateway_cancelled_context(session, stream_id, *, partial_text=Non
 
     Returns True when the context changed.
     """
+    from api.process_event_utils import build_active_turn_token
     from api.streaming import (
         _build_partial_message,
         _normalize_user_text,
@@ -1945,6 +1998,7 @@ def _reconcile_gateway_cancelled_context(session, stream_id, *, partial_text=Non
 
     pending_text = str(getattr(session, "pending_user_message", None) or "")
     pending_started_at = getattr(session, "pending_started_at", None)
+    pending_token = build_active_turn_token(stream_id, pending_started_at)
     prompt_appended_this_call = False
 
     # (a) The interrupted turn's user prompt. cancel_stream and
@@ -1976,6 +2030,12 @@ def _reconcile_gateway_cancelled_context(session, stream_id, *, partial_text=Non
                 "timestamp": recovered_ts,
                 "_recovered": True,
             }
+            if pending_token:
+                # Turn identity for the token-based exclusion on the next
+                # turn: the regenerate path must drop THIS row from outbound
+                # history and from the writeback snapshot instead of
+                # duplicating the prompt (re-gate item 3).
+                user_row["_active_turn_token"] = pending_token
             stamp_message_source(
                 user_row, getattr(session, "pending_user_source", None) or "webui",
             )
@@ -2044,6 +2104,8 @@ def _reconcile_gateway_cancelled_context(session, stream_id, *, partial_text=Non
             return True
         if not isinstance(row, dict):
             return False
+        if pending_token and row.get("_active_turn_token") == pending_token:
+            return True
         if not pending_text:
             return False
         if _normalize_user_text(str(row.get("content") or "")) != _normalize_user_text(pending_text):
@@ -2070,6 +2132,8 @@ def _reconcile_gateway_cancelled_context(session, stream_id, *, partial_text=Non
         partial_row = _build_partial_message(raw_partial, "", []) if raw_partial else None
         if partial_row is not None:
             if context and _interrupted_turn_owns_tail_row(context[-1]):
+                if partial_ts is not None:
+                    partial_row["timestamp"] = partial_ts
                 partial_row[_GATEWAY_CANCEL_RECONCILED_STREAM_KEY] = stream_id
                 context.append(partial_row)
                 changed = True
@@ -2551,6 +2615,15 @@ def _run_gateway_chat_streaming(
                 stored_context
                 if isinstance(stored_context, list) and (regeneration or stored_context)
                 else getattr(s, "messages", None) or []
+            )
+            # The active turn's retained user row (restamped with this
+            # stream's token at regeneration start) is re-materialized below
+            # as user_msg; dropping it from the snapshot keeps the saved model
+            # context at exactly one copy of the prompt (re-gate 2026-10-05
+            # item 3), and the interrupted turn's reconciled partial goes with
+            # it for the same reason.
+            previous_context = _drop_active_turn_rows_for_writeback(
+                previous_context, active_turn_identity,
             )
             previous_process_wakeup_pause = dict(getattr(s, "process_wakeup_pause", {}) or {})
             # Stamp stable ids on the two new rows (shared with the display merge

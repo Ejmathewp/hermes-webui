@@ -16286,10 +16286,22 @@ def cancel_stream(stream_id: str) -> bool:
                     ):
                         from api.gateway_chat import _reconcile_gateway_cancelled_context
 
+                        # ONE whole-second stamp shared by the model-facing
+                        # partial row and the display partial below: two
+                        # independent int(time.time()) calls can straddle a
+                        # second boundary and the display merge key (whole
+                        # seconds) would then insert a second copy of the
+                        # partial on the next successful turn (re-gate
+                        # 2026-10-05 item 5).
+                        _cancel_partial_ts = int(time.time())
                         _reconcile_gateway_cancelled_context(
                             _cs, stream_id, partial_text=_cancel_partial_text,
+                            partial_ts=_cancel_partial_ts,
                         )
+                    else:
+                        _cancel_partial_ts = int(time.time())
                 except Exception:
+                    _cancel_partial_ts = int(time.time())
                     logger.debug(
                         "Failed gateway cancel-context reconcile for %s",
                         stream_id,
@@ -16320,6 +16332,12 @@ def cancel_stream(stream_id: str) -> bool:
                 # call and strict providers would 400 on the malformed entries.
                 # The underscore-prefixed key is not in the whitelist, so sanitize
                 # strips it. The UI reads it via static/messages.js. (v0.50.251.)
+                if _partial_msg is not None:
+                    # Same stamp the context reconcile used for its mirrored
+                    # partial row — one whole-second key so the display merge
+                    # cannot insert a second copy after a boundary straddle
+                    # (re-gate 2026-10-05 item 5).
+                    _partial_msg["timestamp"] = _cancel_partial_ts
                 _cancel_marker_exists = _session_has_cancel_marker(_cs)
                 _cancel_marker_idx = len(_cs.messages)
                 if _cancel_marker_exists:
