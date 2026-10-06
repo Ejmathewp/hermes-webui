@@ -9915,6 +9915,32 @@ def _materialize_pending_user_turn_before_error(
             and list(existing.get('attachments') or []) == pending_attachments
         )
 
+    def ctx_already_has_turn_mirror(ctx):
+        """True when the model context already carries this turn's mirror.
+
+        The gateway cancel-time reconcile (_reconcile_gateway_cancelled_context)
+        mirrors the interrupted prompt into context_messages BEFORE
+        _persist_cancelled_turn runs (re-gate 2026-10-05 item 2 order), and the
+        mirrored partial may trail it. Scanning the recent tail (not just the
+        last row) recognizes that mirror by content + timestamp + source and
+        prevents a second user row on a replayed settle.
+        """
+        if not isinstance(ctx, list) or not ctx:
+            return False
+        for row in reversed(ctx[-8:]):
+            if not (isinstance(row, dict) and row.get('role') == 'user'):
+                continue
+            if _normalize_user_text(_message_text(row.get('content'))) != _normalize_user_text(pending_text):
+                break
+            try:
+                row_ts = int(row.get('timestamp'))
+            except (TypeError, ValueError):
+                break
+            if row_ts == recovered_ts and (row.get('_source') or 'webui') == pending_source:
+                return True
+            break
+        return False
+
     if is_exact_checkpoint(getattr(session, 'messages', None)):
         return False
     recovered = {
@@ -9938,7 +9964,12 @@ def _materialize_pending_user_turn_before_error(
     # Placing the mirror here (rather than in _persist_cancelled_turn) covers
     # all three callers: cancel, provider-error, and exception paths.
     ctx = getattr(session, 'context_messages', None)
-    if isinstance(ctx, list) and ctx and not is_exact_checkpoint(ctx):
+    if (
+        isinstance(ctx, list)
+        and ctx
+        and not is_exact_checkpoint(ctx)
+        and not ctx_already_has_turn_mirror(ctx)
+    ):
         ctx.append(dict(recovered))
     # The new user turn is now committed to messages (#3831): advance a positive
     # truncation watermark left over from a prior retry/undo/edit so that

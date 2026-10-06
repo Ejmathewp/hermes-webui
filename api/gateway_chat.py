@@ -1778,13 +1778,9 @@ def _settle_gateway_cancelled_turn(session_id, stream_id) -> None:
         # Row order matches cancel_stream(): the user turn is materialized
         # before the partial row is placed, and the partial is inserted
         # before any cancel marker that is already present. Clearing the
-        # pending fields here keeps _persist_cancelled_turn's own
+        # NOTE: the pending identity fields are cleared AFTER the reconcile
         # materialize idempotent (no duplicate user row).
         _materialize_pending_user_turn_before_error(session)
-        session.pending_user_message = None
-        session.pending_attachments = []
-        session.pending_started_at = None
-        session.pending_user_source = None
         if partial_msg is not None:
             if not isinstance(session.messages, list):
                 session.messages = []
@@ -1806,12 +1802,28 @@ def _settle_gateway_cancelled_turn(session_id, stream_id) -> None:
                     break
             if not _partial_marker_already_present(session.messages, partial_msg, before_idx=marker_idx):
                 session.messages.insert(marker_idx, partial_msg)
-        _persist_cancelled_turn(session, message="Cancelled by gateway")
-        # Mirror the interrupted turn (prompt + streamed partial) into the
-        # model-facing context while the stream id is still current, so the
-        # next turn's client-built conversation_history carries everything the
-        # gateway persisted at the moment of interruption.
+        # Reconcile BEFORE _persist_cancelled_turn (re-gate 2026-10-05
+        # item 2, kept across the #7978 composition): the reconcile needs
+        # the pending turn identity (pending_user_message /
+        # pending_started_at) to materialize the interrupted prompt into
+        # the model-facing context and to prove the streamed partial
+        # belongs to THAT turn. Persisting first cleared the identity, so
+        # the partial-append guard could only see "any trailing user row"
+        # and a queued prompt's partial landed under an older unanswered
+        # prompt. The status-lane materialization above does NOT clear the
+        # pending identity (only _persist_cancelled_turn does), so this
+        # ordering holds for both cancellation lanes: mirror the
+        # interrupted turn (prompt + streamed partial) into the
+        # model-facing context while the identity is still live, then
+        # persist the cancellation exactly once.
         _reconcile_gateway_cancelled_context(session, stream_id)
+        # Identity cleared only NOW: the reconcile above consumed
+        # pending_user_message / pending_started_at as the turn identity.
+        session.pending_user_message = None
+        session.pending_attachments = []
+        session.pending_started_at = None
+        session.pending_user_source = None
+        _persist_cancelled_turn(session, message="Cancelled by gateway")
         session.gateway_run = None
         session.save()
 
@@ -1829,6 +1841,46 @@ def _gateway_stream_partial_text(stream_id) -> str:
         return ""
 
 
+def _project_transcript_context_rows(messages) -> list:
+    """Project the canonical display transcript into model-facing context rows.
+
+    The same row filters the runs-API history builder applies: error markers,
+    empty partials, reasoning-only assistant rows, and non user/assistant
+    roles never seed the model context. ``_recovered`` flags are KEPT so the
+    builder's answered-turn rule still decides visibility at send time, and
+    timestamps are preserved verbatim so transcript merges recognize the rows
+    as the same ones. Used to seed an EMPTY context_messages from
+    session.messages (imported CLI sessions, first gateway turns cancelled
+    gateway-side) before the interrupted turn is appended.
+    """
+    from api.streaming import (
+        _is_non_replayable_history_row,
+        _is_reasoning_only_assistant_message,
+        _strip_oob_blocks,
+    )
+
+    rows = []
+    for entry in messages or []:
+        if not isinstance(entry, dict):
+            continue
+        if _is_non_replayable_history_row(entry) or _is_reasoning_only_assistant_message(entry):
+            continue
+        role = str(entry.get("role") or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = entry.get("content")
+        if content is None:
+            continue
+        row = {"role": role, "content": _strip_oob_blocks(content)}
+        ts = entry.get("timestamp")
+        if isinstance(ts, (int, float)) and not isinstance(ts, bool) and ts > 0:
+            row["timestamp"] = ts
+        if entry.get("_recovered"):
+            row["_recovered"] = True
+        rows.append(row)
+    return rows
+
+
 def _reconcile_gateway_cancelled_context(session, stream_id, *, partial_text=None) -> bool:
     """Mirror an interrupted gateway turn into the model-facing context.
 
@@ -1841,12 +1893,13 @@ def _reconcile_gateway_cancelled_context(session, stream_id, *, partial_text=Non
     invokes this while the stream id is still current). Session state is saved
     by the caller.
 
-    Order: the interrupted turn's pending user row first, then the partial
-    assistant text the browser saw (STREAM_PARTIAL_TEXT for the stream;
-    skipped when empty). When the context is empty and the prompt was already
-    consumed by an earlier recovery, nothing is mirrored and the next turn
-    falls back to the gateway's own stored transcript, which holds the same
-    adopted rows.
+    Order: the canonical transcript projection when the context is EMPTY (an
+    imported CLI session or a first gateway turn cancelled gateway-side still
+    has the whole conversation in session.messages — never fabricate a
+    two-row world that would replace the gateway's stored transcript, re-gate
+    2026-10-05 item 1), then the interrupted turn's pending user row, then the
+    partial assistant text the browser saw (STREAM_PARTIAL_TEXT for the
+    stream; skipped when empty).
 
     Idempotent per turn/stream identity: the partial row is stamped with the
     settling stream id and user-row mirrors are deduped by content and
@@ -1854,6 +1907,12 @@ def _reconcile_gateway_cancelled_context(session, stream_id, *, partial_text=Non
     can still make the pending-user materializer re-append the prompt AFTER
     the already-reconciled partial (its exact-checkpoint guard only inspects
     the context tail); such trailing duplicates are collapsed here.
+
+    ``partial_ts`` optionally shares ONE whole-second stamp between the
+    model-facing partial row and the display partial cancel_stream appends
+    (re-gate item 5): two independent int(time.time()) calls can straddle a
+    second boundary and the display merge key would then insert a second
+    copy of the partial on the next successful turn.
 
     Returns True when the context changed.
     """
@@ -1872,13 +1931,27 @@ def _reconcile_gateway_cancelled_context(session, stream_id, *, partial_text=Non
 
     changed = False
 
+    # (0) An empty context is not an empty world: seed the canonical
+    # transcript projection (the same row filters the runs-API history
+    # builder applies) BEFORE appending the interrupted turn, so the next
+    # turn's conversation_history carries the prior conversation + the
+    # interrupted turn instead of replacing the gateway's stored transcript
+    # with a two-row world.
+    if not context:
+        seeded = _project_transcript_context_rows(getattr(session, "messages", None))
+        if seeded:
+            context.extend(seeded)
+            changed = True
+
+    pending_text = str(getattr(session, "pending_user_message", None) or "")
+    pending_started_at = getattr(session, "pending_started_at", None)
+    prompt_appended_this_call = False
+
     # (a) The interrupted turn's user prompt. cancel_stream and
     # _persist_cancelled_turn materialize it into session.messages; mirror the
     # same row (content + pending_started_at timestamp) into the context
     # unless an identical row is already there.
-    pending_text = str(getattr(session, "pending_user_message", None) or "")
     if pending_text:
-        pending_started_at = getattr(session, "pending_started_at", None)
         recovered_ts = int(time.time())
         if isinstance(pending_started_at, (int, float)) and pending_started_at > 0:
             recovered_ts = int(pending_started_at)
@@ -1910,6 +1983,7 @@ def _reconcile_gateway_cancelled_context(session, stream_id, *, partial_text=Non
             if pending_attachments:
                 user_row["attachments"] = pending_attachments
             context.append(user_row)
+            prompt_appended_this_call = True
             changed = True
 
     def _user_row_identity(row):
@@ -1957,10 +2031,36 @@ def _reconcile_gateway_cancelled_context(session, stream_id, *, partial_text=Non
             context[reconciled_idx + 1:] = kept
             changed = True
 
+    def _interrupted_turn_owns_tail_row(row) -> bool:
+        """True when the trailing user context row IS the interrupted prompt.
+
+        Ownership is the turn identity, never "any trailing user row" (re-gate
+        item 2): the row this reconcile just materialized, a row carrying this
+        stream's active-turn token (a replayed settle after the pending state
+        was cleared), or an identical content + pending_started_at timestamp
+        row (the transcript-recovery materializer's shape).
+        """
+        if prompt_appended_this_call:
+            return True
+        if not isinstance(row, dict):
+            return False
+        if not pending_text:
+            return False
+        if _normalize_user_text(str(row.get("content") or "")) != _normalize_user_text(pending_text):
+            return False
+        if not (isinstance(pending_started_at, (int, float)) and pending_started_at > 0):
+            return True
+        try:
+            row_ts = int(row.get("timestamp") or 0)
+        except (TypeError, ValueError):
+            return False
+        return row_ts == int(pending_started_at)
+
     # (b) The partial assistant text the browser saw (what the gateway's
-    # persisted incomplete snapshot holds). Only appended while the
-    # interrupted prompt is the live context tail — never orphaned under the
-    # wrong turn (e.g. after a user edit shortened the context).
+    # persisted incomplete snapshot holds). Only appended while the context
+    # tail is the interrupted prompt's OWN row — identity/token matched, not
+    # merely a trailing user row, which can be an older unanswered prompt
+    # (re-gate 2026-10-05 item 2).
     if reconciled_idx is None:
         raw_partial = (
             partial_text
@@ -1969,7 +2069,7 @@ def _reconcile_gateway_cancelled_context(session, stream_id, *, partial_text=Non
         )
         partial_row = _build_partial_message(raw_partial, "", []) if raw_partial else None
         if partial_row is not None:
-            if context and isinstance(context[-1], dict) and context[-1].get("role") == "user":
+            if context and _interrupted_turn_owns_tail_row(context[-1]):
                 partial_row[_GATEWAY_CANCEL_RECONCILED_STREAM_KEY] = stream_id
                 context.append(partial_row)
                 changed = True
