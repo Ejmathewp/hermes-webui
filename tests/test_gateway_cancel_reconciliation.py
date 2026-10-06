@@ -100,11 +100,15 @@ class _SseResponse:
     def __iter__(self):
         if self._run_id in _SseResponse.cancelled_runs:
             # Gateway-side cancel: persist the incomplete snapshot into the
-            # gateway's own store (adopt/persist path) before reporting.
+            # gateway's own store (adopt/persist path) before reporting. The
+            # worker resets STREAM_PARTIAL_TEXT at startup, so the partial it
+            # reconciles is whatever THIS stream relayed before the terminal
+            # event — stream a delta first, exactly like a real interrupted run.
             body = _last_admitted_body()
             sid = str(body.get("session_id") or "")
             GATEWAY_STORE.setdefault(sid, []).extend(_gateway_adopted_rows(body))
             _SseResponse.cancelled_runs.discard(self._run_id)
+            yield b'data: {"event":"message.delta","delta":"gateway cut"}\n\n'
             yield b'data: {"event":"run.cancelled"}\n\n'
         else:
             yield b'data: {"event":"run.completed","output":"turn answer","usage":{"input_tokens":1,"output_tokens":1}}\n\n'
@@ -139,7 +143,10 @@ def fake_urlopen(req, *, timeout=None):
         CAPTURED_BODIES.append(body)
         return _JsonResponse({"run_id": f"run-{len(CAPTURED_BODIES)}"})
     if "/events" in url:
-        run_id = url.rstrip("/").rsplit("/", 1)[-1]
+        # .../v1/runs/<run_id>/events — the run id sits BEFORE /events, not at
+        # the tail (the old rsplit parsed the literal "events" and the
+        # cancelled_runs arming could never match).
+        run_id = url.split("/v1/runs/", 1)[1].split("/events", 1)[0]
         return _SseResponse(run_id)
     raise AssertionError(f"unexpected gateway request: {url}")
 
@@ -234,12 +241,12 @@ def teardown_stream_state(stream_id):
     cfg.unregister_active_run(stream_id)
 
 
-def admit_run(session_id, *, msg_text, prefill_messages=None, context_messages=None):
+def admit_run(session_id, *, msg_text, prefill_messages=None, context_messages=None, stream_id=None):
     """Drive the real _run_gateway_runs_api_streaming; return the captured body."""
     from api.gateway_chat import _STREAM_RUN_IDS, _run_gateway_runs_api_streaming
 
     del CAPTURED_BODIES[:]
-    stream_id = f"stream-admit-{session_id}"
+    stream_id = stream_id or f"stream-admit-{session_id}"
     with cfg.STREAMS_LOCK:
         cfg.STREAM_PARTIAL_TEXT[stream_id] = ""
         cfg.STREAM_REASONING_TEXT[stream_id] = ""
@@ -488,6 +495,321 @@ class ReconciliationHarness(unittest.TestCase):
             f"double settle must not duplicate the user row, got {len(user_rows)}: {ctx}",
         )
         teardown_stream_state(stream_id)
+
+    # ── Round-3 re-gate (2026-10-05 22:07 UTC): CORE items 1-3 ───────────────
+
+    def test_7_empty_context_seeded_from_transcript_before_interrupt(self):
+        """Item 1: Stop on an imported-CLI-shaped session keeps the whole history.
+
+        context_messages is EMPTY while session.messages holds the prior
+        conversation. The reconcile must seed the canonical transcript
+        projection BEFORE appending the interrupted turn; otherwise the next
+        turn's outbound history is a two-row world that replaces the gateway's
+        stored transcript and the earlier conversation drops out of model
+        context.
+        """
+        from api.streaming import cancel_stream
+
+        session = make_session(
+            "imported", [],
+            messages=[
+                {"role": "user", "content": "u0"},
+                {"role": "assistant", "content": "a0"},
+            ],
+        )
+        # Imported CLI shape: empty model-facing context, full transcript.
+        session.context_messages = []
+        session.save()
+
+        stream_id = "stream-import"
+        set_mid_turn_stream_state(session, stream_id, partial="imported partial", prompt="q1")
+        self.assertTrue(cancel_stream(stream_id))
+        teardown_stream_state(stream_id)
+
+        body = admit_run(session.session_id, msg_text="q2")
+
+        self.assertEqual(
+            history_rows(body),
+            [
+                ("user", "u0"),
+                ("assistant", "a0"),
+                ("user", "q1"),
+                ("assistant", "imported partial"),
+            ],
+            "empty context must be seeded from the transcript projection before "
+            f"the interrupted turn is appended, got {history_rows(body)}",
+        )
+        self.assertEqual(body.get("input"), "q2")
+
+    def test_8_settle_attaches_partial_to_its_own_turn_not_older_prompt(self):
+        """Item 2: the settle must reconcile while the pending identity is live.
+
+        A queued prompt B runs (eager checkpoint in the transcript) while an
+        older user row (turn A) is still unanswered in the context. Persisting
+        the cancellation BEFORE the reconcile cleared the pending identity:
+        the pending-turn materializer's token dedup then returned early
+        without mirroring B into the context, and the partial-append guard —
+        seeing only "any trailing user row" — attached B's partial under A.
+        """
+        from api.gateway_chat import _settle_gateway_cancelled_turn
+        from api.routes import _checkpoint_user_message_for_eager_session_save
+
+        session = make_session("queued", [
+            {"role": "user", "content": "u0"},
+            {"role": "assistant", "content": "a0"},
+            {"role": "user", "content": "A-old"},
+        ])
+        stream_id = "stream-queued"
+        started = set_mid_turn_stream_state(session, stream_id, partial="B partial", prompt="qB")
+        # Eager save mode: the turn's user row is checkpointed into the
+        # transcript (with the active-turn token) at chat-start.
+        _checkpoint_user_message_for_eager_session_save(
+            session, "qB", [], started,
+        )
+        session.save()
+
+        _settle_gateway_cancelled_turn(session.session_id, stream_id)
+
+        ctx = get_session(session.session_id).context_messages
+        self.assertEqual(
+            history_rows({"conversation_history": [
+                {"role": row.get("role"), "content": row.get("content")}
+                for row in ctx
+            ]}),
+            [
+                ("user", "u0"),
+                ("assistant", "a0"),
+                ("user", "A-old"),
+                ("user", "qB"),
+                ("assistant", "B partial"),
+            ],
+            "the partial must attach to B's own row; older rows untouched, "
+            f"got {ctx}",
+        )
+        teardown_stream_state(stream_id)
+
+    def _prepare_regenerate_start(self, session, msg_text):
+        """Run the production regenerate-start steps and persist the result.
+
+        Mirrors _start_regeneration_stream_locked: plan, apply (truncate at
+        the retained row), then _prepare_chat_start_session_for_stream, which
+        restamps the retained context row with the NEW stream's active-turn
+        token, then saves.
+        """
+        from api.routes import (
+            _RETAINED_CONTEXT_USER_UNSET,
+            _prepare_chat_start_session_for_stream,
+        )
+        from api.session_ops import apply_regeneration_plan, plan_regeneration
+
+        fresh = get_session(session.session_id)
+        plan = plan_regeneration(fresh)
+        self.assertIsNotNone(plan)
+        applied, retained_context_user = apply_regeneration_plan(
+            fresh, plan, return_context_user=True,
+        )
+        self.assertTrue(applied)
+        retained_user = fresh.messages[-1]
+        stream_id = f"stream-regen-{session.session_id[-6:]}"
+        _prepare_chat_start_session_for_stream(
+            fresh,
+            msg=plan.turn.message_text,
+            attachments=[],
+            workspace="/tmp",
+            model="test-model",
+            model_provider="",
+            stream_id=stream_id,
+            source="webui",
+            retained_user=retained_user,
+            retained_context_user=(
+                retained_context_user
+                if retained_context_user is not None
+                else _RETAINED_CONTEXT_USER_UNSET
+            ),
+            defer_save=True,
+        )
+        # _start_regeneration_stream_locked saves right after prepare; the
+        # worker's get_session must see the restamped row.
+        fresh.save()
+        return stream_id
+
+    def test_9_regenerate_after_stop_sends_prompt_exactly_once(self):
+        """Item 3a: Stop then regenerate - the gateway sees the prompt once.
+
+        Pinned to the post-Stop regenerate-admission state the maintainer's
+        repro produced: the retained interrupted-turn user row (restamped at
+        regenerate start with the NEW stream's token) followed by the
+        reconciled partial. Sending that row in conversation_history as well
+        as `input` made the gateway see the prompt twice.
+        """
+        from api.process_event_utils import build_active_turn_token
+
+        session = make_session("regen", [
+            {"role": "user", "content": "u0"},
+            {"role": "assistant", "content": "a0"},
+        ])
+        stop_stream = "stream-stop-regen"
+        started = set_mid_turn_stream_state(
+            session, stop_stream, partial="cut off mid", prompt="q1",
+        )
+        teardown_stream_state(stop_stream)
+
+        # Regenerate start: the plan truncates at the retained row and
+        # _prepare_chat_start_session_for_stream restamps it with the NEW
+        # stream's token; the reconciled partial trails it.
+        regen_stream = "stream-regen-once"
+        token = build_active_turn_token(regen_stream, started)
+        session.context_messages = [
+            {"role": "user", "content": "u0"},
+            {"role": "assistant", "content": "a0"},
+            {
+                "role": "user", "content": "q1", "_recovered": True,
+                "_active_turn_token": token, "timestamp": int(started),
+            },
+            {
+                "role": "assistant", "content": "cut off mid", "_partial": True,
+                "_gateway_cancelled_stream": stop_stream,
+            },
+        ]
+        session.active_stream_id = regen_stream
+        session.pending_user_message = "q1"
+        session.pending_started_at = started
+        session.pending_attachments = []
+        session.pending_user_source = "webui"
+        session.save()
+
+        body = admit_run(session.session_id, msg_text="q1", stream_id=regen_stream)
+
+        seen = history_rows(body).count(("user", "q1"))
+        if body.get("input") == "q1":
+            seen += 1
+        self.assertEqual(
+            seen, 1,
+            f"regenerate must deliver the prompt exactly once, got {seen}: "
+            f"input={body.get('input')!r} history={history_rows(body)}",
+        )
+        self.assertEqual(body.get("input"), "q1")
+        teardown_stream_state(regen_stream)
+
+    def _gateway_worker_env(self):
+        return patch.dict(os.environ, {
+            "HERMES_WEBUI_CHAT_BACKEND": "gateway",
+            "HERMES_WEBUI_GATEWAY_USE_RUNS_API": "1",
+        })
+
+    def _drive_full_worker(self, session_id, msg_text, stream_id):
+        """Drive the real _run_gateway_chat_streaming end to end."""
+        import api.gateway_chat as gateway_chat
+        from api.config import create_stream_channel
+
+        with cfg.STREAMS_LOCK:
+            cfg.STREAMS[stream_id] = create_stream_channel()
+        with patch.object(gateway_chat, "gateway_supports_approval", lambda *a, **k: True), \
+                patch.object(gateway_chat.urllib.request, "urlopen", side_effect=fake_urlopen):
+            gateway_chat._run_gateway_chat_streaming(
+                session_id, msg_text, "test-model", "/tmp", stream_id, [],
+            )
+
+    def test_10_regenerate_writeback_saves_single_user_row(self):
+        """Item 3b: post-regeneration success writeback keeps ONE prompt row."""
+        from api.streaming import cancel_stream
+
+        session = make_session("regen-writeback", [
+            {"role": "user", "content": "u0"},
+            {"role": "assistant", "content": "a0"},
+        ])
+        stop_stream = "stream-stop-wb"
+        set_mid_turn_stream_state(session, stop_stream, partial="cut off mid", prompt="q1")
+        self.assertTrue(cancel_stream(stop_stream))
+        teardown_stream_state(stop_stream)
+
+        stream_id = self._prepare_regenerate_start(session, "q1")
+        with self._gateway_worker_env():
+            self._drive_full_worker(session.session_id, "q1", stream_id)
+
+        saved = get_session(session.session_id)
+        ctx = saved.context_messages
+        user_rows = [
+            row for row in ctx
+            if isinstance(row, dict) and row.get("role") == "user" and row.get("content") == "q1"
+        ]
+        self.assertEqual(
+            len(user_rows), 1,
+            f"writeback must save exactly one q1 user row, got {len(user_rows)}: {ctx}",
+        )
+        assistant_rows = [
+            row for row in ctx
+            if isinstance(row, dict) and row.get("role") == "assistant"
+            and row.get("content") == "turn answer"
+        ]
+        self.assertEqual(
+            len(assistant_rows), 1,
+            f"writeback must save the regenerated answer once, got {ctx}",
+        )
+        self.assertIsNone(saved.gateway_run)
+        self.assertIsNone(saved.active_stream_id)
+        teardown_stream_state(stream_id)
+
+    def test_11_run_cancelled_event_settles_reconciles_and_matches_store(self):
+        """Item 6 headline: the worker's run.cancelled path reconciles context.
+
+        The gateway cancels the run mid-stream; the worker must settle the
+        cancelled turn (prompt + streamed partial into context), clear the run
+        record, and the next turn's history must carry the interrupted turn
+        matching the gateway's own persisted store.
+        """
+        session = make_session("worker-cancel", [
+            {"role": "user", "content": "u0"},
+            {"role": "assistant", "content": "a0"},
+        ])
+        stream_id = "stream-worker-cancel"
+        set_mid_turn_stream_state(session, stream_id, partial="gateway cut", prompt="q1")
+
+        # Arm a gateway-side cancel for the admitted run id (run-1).
+        _SseResponse.cancelled_runs.add("run-1")
+        with self._gateway_worker_env():
+            self._drive_full_worker(session.session_id, "q1", stream_id)
+
+        saved = get_session(session.session_id)
+        self.assertIsNone(saved.gateway_run, "cancel settle must clear the run record")
+        # The gateway adopted/persisted the interrupted turn in its own store.
+        self.assertEqual(
+            GATEWAY_STORE.get(session.session_id),
+            [
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": "gateway-persisted partial"},
+            ],
+            f"gateway store must hold the adopted interrupted turn, got {GATEWAY_STORE}",
+        )
+        # WebUI's mirror: prompt + streamed partial under it.
+        ctx = saved.context_messages
+        self.assertEqual(
+            history_rows({"conversation_history": [
+                {"role": row.get("role"), "content": row.get("content")}
+                for row in ctx
+            ]}),
+            [
+                ("user", "u0"),
+                ("assistant", "a0"),
+                ("user", "q1"),
+                ("assistant", "gateway cut"),
+            ],
+            f"run.cancelled must reconcile prompt + partial into context, got {ctx}",
+        )
+        teardown_stream_state(stream_id)
+
+        # Next turn: the outbound history carries the interrupted turn.
+        body = admit_run(session.session_id, msg_text="q2")
+        self.assertEqual(
+            history_rows(body),
+            [
+                ("user", "u0"),
+                ("assistant", "a0"),
+                ("user", "q1"),
+                ("assistant", "gateway cut"),
+            ],
+            f"next turn must keep the story after a gateway-side cancel, got {history_rows(body)}",
+        )
 
 
 if __name__ == "__main__":

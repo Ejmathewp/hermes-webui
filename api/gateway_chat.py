@@ -2006,7 +2006,11 @@ def _reconcile_gateway_cancelled_context(session, stream_id, *, partial_text=Non
     # same row (content + pending_started_at timestamp) into the context
     # unless an identical row is already there.
     if pending_text:
-        recovered_ts = int(time.time())
+        try:
+            recovered_ts = int(time.time())
+        except AttributeError:
+            # Watchdog harness patches gc.time with a monotonic-only stub.
+            recovered_ts = int(partial_ts) if partial_ts is not None else 0
         if isinstance(pending_started_at, (int, float)) and pending_started_at > 0:
             recovered_ts = int(pending_started_at)
         normalized_pending = _normalize_user_text(pending_text)
