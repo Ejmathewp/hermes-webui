@@ -985,11 +985,19 @@ def _run_gateway_runs_api_streaming(
         # that same interrupted turn is dropped with it.
         active_turn_identity = _active_turn_authority(session, stream_id, msg_text)
         drop_reconciled_partial = False
+        # Set when the token match excluded the retained active-turn user
+        # row (it rides as `input` alone). If that exclusion leaves the
+        # outbound history EMPTY we must still send a non-empty
+        # conversation_history: an absent (or empty) key makes the Gateway
+        # admission handler fall back to its own stored transcript, which
+        # reloads turns the user just deleted (re-gate 2026-10-06 item 2).
+        active_row_excluded = False
         for entry in getattr(session, "context_messages", None) or []:
             if not isinstance(entry, dict):
                 continue
             if _active_turn_token_matches(entry, active_turn_identity):
                 drop_reconciled_partial = True
+                active_row_excluded = True
                 continue
             if (
                 drop_reconciled_partial
@@ -1047,6 +1055,17 @@ def _run_gateway_runs_api_streaming(
             run_body["instructions"] = "\n\n".join(part for part in instructions_parts if part)
         if conversation_history:
             run_body["conversation_history"] = conversation_history
+        elif active_row_excluded:
+            # The retained active-turn row was excluded and NOTHING else
+            # survived the filters: the caller-supplied history is
+            # deliberately empty. Keep the key non-empty with a system-only
+            # sentinel so the admission handler takes this body as-is
+            # instead of falling back to its stored transcript and
+            # resurrecting deleted turns (re-gate 2026-10-06 item 2). The
+            # prompt travels in `input` only.
+            run_body["conversation_history"] = [
+                {"role": "system", "content": "No earlier conversation turns."}
+            ]
         update_active_run(stream_id, phase="gateway-request")
         # Persist the exact body first: a restart before the run id is saved replays this admission.
         if on_run_id is not None:

@@ -858,6 +858,194 @@ class ReconciliationHarness(unittest.TestCase):
         )
         self.assertEqual(body.get("input"), "q2")
 
+    def test_13_truncated_regenerate_sends_sentinel_not_deleted_rows(self):
+        """Item 2a: Stop -> truncate -> regenerate must not resurrect turns.
+
+        Excluding the retained active-turn user row empties the outbound
+        history; dropping the conversation_history key (or sending []) makes
+        the Gateway admission handler fall back to its stored transcript and
+        reload the deleted rows. The builder must send a non-empty
+        system-only sentinel instead, with the prompt only in `input`.
+        """
+        from api.streaming import cancel_stream
+
+        session = make_session("trunc-regen", [
+            {"role": "user", "content": "u0"},
+            {"role": "assistant", "content": "a0"},
+        ])
+        stop_stream = "stream-stop-trunc"
+        set_mid_turn_stream_state(session, stop_stream, partial="cut off mid", prompt="q1")
+        self.assertTrue(cancel_stream(stop_stream))
+        teardown_stream_state(stop_stream)
+
+        status, ok, bad = drive_route(
+            "/api/session/truncate",
+            {"session_id": session.session_id, "keep_count": 2},
+        )
+        self.assertIsNone(bad, bad)
+        self.assertEqual(status, 200, ok)
+
+        regen_stream = self._prepare_regenerate_start(session, "u0")
+        fresh = get_session(session.session_id)
+        self.assertEqual(
+            [(row.get("role"), row.get("content")) for row in fresh.context_messages],
+            [("user", "u0")],
+            f"pinned admission state: truncate + regenerate leaves the "
+            f"retained row alone, got {fresh.context_messages}",
+        )
+
+        body = admit_run(session.session_id, msg_text="u0", stream_id=regen_stream)
+
+        self.assertEqual(
+            body.get("conversation_history"),
+            [{"role": "system", "content": "No earlier conversation turns."}],
+            "an empty-by-exclusion history must send the system-only "
+            f"sentinel, got {body.get('conversation_history')}",
+        )
+        self.assertEqual(body.get("input"), "u0")
+        # The deleted interrupted turn must not ride anywhere in the body.
+        flat = json.dumps(body)
+        self.assertNotIn("q1", flat, f"deleted prompt resurrected into the body: {flat}")
+        self.assertNotIn("cut off mid", flat, f"deleted partial resurrected into the body: {flat}")
+        teardown_stream_state(regen_stream)
+
+    def _drive_full_worker_with_gateway_fallback(self, session_id, msg_text, stream_id):
+        """Drive the real worker with the gateway's admission fallback applied.
+
+        gateway/platforms/api_server_runs.py ~712-714: a body WITHOUT a
+        non-empty conversation_history makes the gateway load its OWN stored
+        transcript as the run's context. The fake mirrors that: when the
+        fallback fires, the completed run's output is stamped with the rows
+        it reloaded, so resurrection is observable in the answer WebUI saves.
+        """
+        import api.gateway_chat as gateway_chat
+        from api.config import create_stream_channel
+
+        captured = []
+
+        def capturing_urlopen(req, *, timeout=None):
+            url = req.full_url
+            if url.endswith("/v1/runs"):
+                body = json.loads(req.data.decode("utf-8"))
+                captured.append(body)
+                return _JsonResponse({"run_id": f"run-{len(CAPTURED_BODIES) + len(captured)}"})
+            return fake_urlopen(req, timeout=timeout)
+
+        class _FallbackSseResponse(_SseResponse):
+            def __iter__(self):
+                if self._run_id in _SseResponse.cancelled_runs:
+                    yield from super().__iter__()
+                    return
+                body = captured[-1] if captured else {}
+                if not body.get("conversation_history"):
+                    # Gateway fallback: load its own stored transcript.
+                    stored = GATEWAY_STORE.get(
+                        str(body.get("session_id") or ""), []
+                    )
+                    reloaded = "|".join(
+                        str(row.get("content") or "") for row in stored
+                    )
+                    output = f"reloaded[{reloaded}]"
+                else:
+                    output = "turn answer"
+                yield (
+                    b'data: {"event":"run.completed","output":'
+                    + json.dumps(output).encode("utf-8")
+                    + b',"usage":{"input_tokens":1,"output_tokens":1}}\n\n'
+                )
+                yield b"data: [DONE]\n\n"
+
+        def fallback_urlopen(req, *, timeout=None):
+            url = req.full_url
+            if "/events" in url:
+                run_id = url.split("/v1/runs/", 1)[1].split("/events", 1)[0]
+                return _FallbackSseResponse(run_id)
+            return capturing_urlopen(req, timeout=timeout)
+
+        with cfg.STREAMS_LOCK:
+            cfg.STREAMS[stream_id] = create_stream_channel()
+        with patch.object(gateway_chat, "gateway_supports_approval", lambda *a, **k: True), \
+                patch.object(gateway_chat.urllib.request, "urlopen", side_effect=fallback_urlopen):
+            gateway_chat._run_gateway_chat_streaming(
+                session_id, msg_text, "test-model", "/tmp", stream_id, [],
+            )
+        if captured:
+            del CAPTURED_BODIES[:]
+            CAPTURED_BODIES.extend(captured)
+
+    def test_14_truncated_regenerate_writeback_saves_one_user_row(self):
+        """Item 2b: after the sentinel run the writeback saves ONE user row.
+
+        Without the sentinel the gateway reloads its stored transcript (the
+        deleted interrupted turn included); the answer comes back composed
+        over resurrected rows. With the sentinel the run is clean and the
+        writeback saves exactly one user row + one fresh answer, with no
+        deleted rows and no sentinel row in the saved model context.
+        """
+        from api.streaming import cancel_stream
+
+        session = make_session("trunc-wb", [
+            {"role": "user", "content": "u0"},
+            {"role": "assistant", "content": "a0"},
+        ])
+        stop_stream = "stream-stop-wb2"
+        set_mid_turn_stream_state(session, stop_stream, partial="cut off mid", prompt="q1")
+        self.assertTrue(cancel_stream(stop_stream))
+        teardown_stream_state(stop_stream)
+
+        # The gateway adopted the interrupted turn into its own transcript.
+        GATEWAY_STORE[session.session_id] = [
+            {"role": "user", "content": "u0"},
+            {"role": "assistant", "content": "a0"},
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "cut off mid"},
+        ]
+
+        status, ok, bad = drive_route(
+            "/api/session/truncate",
+            {"session_id": session.session_id, "keep_count": 2},
+        )
+        self.assertIsNone(bad, bad)
+        self.assertEqual(status, 200, ok)
+
+        stream_id = self._prepare_regenerate_start(session, "u0")
+        with self._gateway_worker_env():
+            self._drive_full_worker_with_gateway_fallback(
+                session.session_id, "u0", stream_id,
+            )
+
+        saved = get_session(session.session_id)
+        ctx = saved.context_messages
+        user_rows = [
+            row for row in ctx
+            if isinstance(row, dict) and row.get("role") == "user"
+        ]
+        self.assertEqual(
+            [(row.get("content")) for row in user_rows],
+            ["u0"],
+            f"writeback must save exactly one user row (the retained "
+            f"prompt), got {ctx}",
+        )
+        assistant_rows = [
+            row.get("content") for row in ctx
+            if isinstance(row, dict) and row.get("role") == "assistant"
+        ]
+        self.assertEqual(
+            assistant_rows,
+            ["turn answer"],
+            f"the answer must be composed over the SENTINEL (no gateway "
+            f"transcript fallback), got {assistant_rows}",
+        )
+        flat = json.dumps(ctx)
+        self.assertNotIn("q1", flat, f"deleted prompt resurrected into saved context: {flat}")
+        self.assertNotIn("cut off mid", flat, f"deleted partial resurrected: {flat}")
+        self.assertNotIn(
+            "No earlier conversation turns.", flat,
+            f"the sentinel is transport-only and must never be saved: {flat}",
+        )
+        teardown_stream_state(stream_id)
+
+
 
 
 if __name__ == "__main__":
