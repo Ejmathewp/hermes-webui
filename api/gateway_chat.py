@@ -2136,6 +2136,13 @@ def _reconcile_gateway_cancelled_context(session, stream_id, *, partial_text=Non
         partial_row = _build_partial_message(raw_partial, "", []) if raw_partial else None
         if partial_row is not None:
             if context and _interrupted_turn_owns_tail_row(context[-1]):
+                # The partial is about to ride directly under its verified
+                # owning user row: that pair IS the interrupted turn, so the
+                # row is no longer a possibly-unanswered recovered prompt.
+                # Clearing the flag keeps the runs-API history builder from
+                # dropping the question and pairing the partial with the
+                # wrong one (re-gate 2026-10-06 item 1).
+                context[-1].pop("_recovered", None)
                 if partial_ts is not None:
                     partial_row["timestamp"] = partial_ts
                 partial_row[_GATEWAY_CANCEL_RECONCILED_STREAM_KEY] = stream_id

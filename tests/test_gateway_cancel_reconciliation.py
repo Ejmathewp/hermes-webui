@@ -811,6 +811,54 @@ class ReconciliationHarness(unittest.TestCase):
             f"next turn must keep the story after a gateway-side cancel, got {history_rows(body)}",
         )
 
+    # ── Round-4 re-gate (2026-10-06 14:38 UTC): CORE items 1-2 + SILENT item 3
+
+    def test_12_eager_stop_history_pairs_partial_with_its_own_question(self):
+        """Item 1: the recovered-question filter must not orphan the partial.
+
+        Eager-save Stop with an older unanswered A-old in context: the stored
+        context is correct ([A-old, qB, B partial]) but the history builder's
+        recovered-row rule drops qB (a _recovered row preceded by a user
+        row), so the Gateway receives [A-old, B partial] — the partial paired
+        with the wrong question. The reconcile must clear the owning row's
+        recovered flag right before appending the partial under it, so the
+        partial rides with its own question.
+        """
+        from api.gateway_chat import _settle_gateway_cancelled_turn
+        from api.routes import _checkpoint_user_message_for_eager_session_save
+
+        session = make_session("queued-history", [
+            {"role": "user", "content": "u0"},
+            {"role": "assistant", "content": "a0"},
+            {"role": "user", "content": "A-old"},
+        ])
+        stream_id = "stream-queued-hist"
+        started = set_mid_turn_stream_state(session, stream_id, partial="B partial", prompt="qB")
+        _checkpoint_user_message_for_eager_session_save(
+            session, "qB", [], started,
+        )
+        session.save()
+
+        _settle_gateway_cancelled_turn(session.session_id, stream_id)
+        teardown_stream_state(stream_id)
+
+        body = admit_run(session.session_id, msg_text="q2")
+
+        self.assertEqual(
+            history_rows(body),
+            [
+                ("user", "u0"),
+                ("assistant", "a0"),
+                ("user", "A-old"),
+                ("user", "qB"),
+                ("assistant", "B partial"),
+            ],
+            "the partial must ride with its OWN question: qB must not be "
+            f"dropped from the outbound history, got {history_rows(body)}",
+        )
+        self.assertEqual(body.get("input"), "q2")
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
