@@ -2039,6 +2039,18 @@ def _reconcile_gateway_cancelled_context(session, stream_id, *, partial_text=Non
                 continue
             if _normalize_user_text(str(row.get("content") or "")) != normalized_pending:
                 break
+            if (
+                pending_token
+                and row.get("_active_turn_token")
+                and row.get("_active_turn_token") != pending_token
+            ):
+                # Text + integer-second timestamp is not ownership (re-gate
+                # 2026-10-06 item 3): a DIFFERENT stream's identical prompt
+                # interrupted inside the same second carries its own token,
+                # and this turn must still be mirrored. Rows without a token
+                # (legacy data, lossless-unto-them projections) keep the
+                # established timestamp check.
+                break
             try:
                 row_ts = int(row.get("timestamp") or 0)
             except (TypeError, ValueError):
@@ -2070,14 +2082,24 @@ def _reconcile_gateway_cancelled_context(session, stream_id, *, partial_text=Non
             changed = True
 
     def _user_row_identity(row):
-        """Comparable identity for a user context row (or None)."""
+        """Comparable identity for a user context row (or None).
+
+        The active-turn token is part of the identity (re-gate 2026-10-06
+        item 3): two interrupts of the same prompt inside one second share
+        content and integer-second timestamp but never a token, so a replay
+        collapse for one turn must never swallow the other turn's row.
+        """
         if not isinstance(row, dict) or row.get("role") != "user":
             return None
         try:
             row_ts = int(row.get("timestamp") or 0)
         except (TypeError, ValueError):
             row_ts = -1
-        return (_normalize_user_text(str(row.get("content") or "")), row_ts)
+        return (
+            _normalize_user_text(str(row.get("content") or "")),
+            row_ts,
+            row.get("_active_turn_token"),
+        )
 
     # Locate a partial this stream already reconciled, and collapse any
     # replayed user rows the materializer appended after it.

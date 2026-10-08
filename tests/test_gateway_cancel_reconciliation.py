@@ -1045,7 +1045,90 @@ class ReconciliationHarness(unittest.TestCase):
         )
         teardown_stream_state(stream_id)
 
+    def test_15_two_interrupts_same_second_stay_distinct_turns(self):
+        """Item 3: same-prompt interrupts within one second are two turns.
 
+        The mirror dedup matched content + int-second timestamp, so the
+        second interrupt of prompt P inside the same wall second was treated
+        as already mirrored: its prompt AND partial never reached the
+        context, and the next admission carried only one turn. Recovered
+        rows must carry their stream-bound `_active_turn_token` and dedups
+        must require token match — text+second is not ownership.
+        """
+        from api.process_event_utils import build_active_turn_token
+        from api.streaming import cancel_stream
+
+        session = make_session("twice", [
+            {"role": "user", "content": "u0"},
+            {"role": "assistant", "content": "a0"},
+        ])
+        fixed_started = 1790000000.5  # both interrupts share one wall second
+
+        stream_1 = "stream-twice-1"
+        set_mid_turn_stream_state(session, stream_1, partial="P partial one", prompt="P")
+        session.pending_started_at = fixed_started
+        session.save()
+        self.assertTrue(cancel_stream(stream_1))
+        teardown_stream_state(stream_1)
+
+        stream_2 = "stream-twice-2"
+        # Re-resolve the session the way the next turn's route does: the
+        # first cancel's writeback ran on the object get_session resolved,
+        # and stale object handles must never be re-armed (same pattern as
+        # the double-settle replay above).
+        session = get_session(session.session_id)
+        set_mid_turn_stream_state(session, stream_2, partial="P partial two", prompt="P")
+        session.pending_started_at = fixed_started
+        session.save()
+        self.assertTrue(cancel_stream(stream_2))
+        teardown_stream_state(stream_2)
+
+        saved = get_session(session.session_id)
+
+        ctx = saved.context_messages
+        expected_ctx_shapes = [
+            ("user", "u0"),
+            ("assistant", "a0"),
+            ("user", "P"),
+            ("assistant", "P partial one"),
+            ("user", "P"),
+            ("assistant", "P partial two"),
+        ]
+        self.assertEqual(
+            [(row.get("role"), row.get("content")) for row in ctx],
+            expected_ctx_shapes,
+            "two interrupts of the same prompt inside one second must stay "
+            f"two distinct turns in the model context, got {ctx}",
+        )
+        p_tokens = [
+            row.get("_active_turn_token") for row in ctx
+            if row.get("role") == "user" and row.get("content") == "P"
+        ]
+        self.assertEqual(
+            p_tokens,
+            [
+                build_active_turn_token(stream_1, fixed_started),
+                build_active_turn_token(stream_2, fixed_started),
+            ],
+            f"each interrupt's row must carry its own stream-bound token, got {p_tokens}",
+        )
+        # Transcript side: the second interrupt must not collapse into the
+        # first turn's row either.
+        msg_p_rows = [
+            row for row in saved.messages
+            if isinstance(row, dict) and row.get("role") == "user" and row.get("content") == "P"
+        ]
+        self.assertEqual(
+            len(msg_p_rows), 2,
+            f"the transcript must hold BOTH interrupts' user rows, got {saved.messages}",
+        )
+
+        body = admit_run(session.session_id, msg_text="q2")
+        self.assertEqual(
+            history_rows(body),
+            expected_ctx_shapes,
+            f"next admission must carry both interrupted turns, got {history_rows(body)}",
+        )
 
 
 if __name__ == "__main__":

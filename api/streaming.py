@@ -9903,6 +9903,14 @@ def _materialize_pending_user_turn_before_error(
         existing = messages[-1]
         if not isinstance(existing, dict) or existing.get('role') != 'user':
             return False
+        if active_turn_token and existing.get('_active_turn_token') and existing.get('_active_turn_token') != active_turn_token:
+            # Text + integer-second timestamp is not ownership (re-gate
+            # 2026-10-06 item 3): a second interrupt of the same prompt
+            # inside one second carries a DIFFERENT stream token, and this
+            # turn's recovery must run instead of collapsing into the other
+            # turn's row. Token-less rows (legacy data) keep the established
+            # timestamp check.
+            return False
         existing_source = existing.get('_source') or 'webui'
         try:
             existing_ts = int(existing.get('timestamp'))
@@ -9932,6 +9940,17 @@ def _materialize_pending_user_turn_before_error(
                 continue
             if _normalize_user_text(_message_text(row.get('content'))) != _normalize_user_text(pending_text):
                 break
+            if (
+                active_turn_token
+                and row.get('_active_turn_token')
+                and row.get('_active_turn_token') != active_turn_token
+            ):
+                # Not this stream's row (re-gate 2026-10-06 item 3): the
+                # reconcile may not have mirrored this turn yet, or the
+                # matching row belongs to a different interrupt of the same
+                # prompt inside the same second. Token-less rows keep the
+                # established timestamp check.
+                break
             try:
                 row_ts = int(row.get('timestamp'))
             except (TypeError, ValueError):
@@ -9951,7 +9970,10 @@ def _materialize_pending_user_turn_before_error(
     }
     if str(pending_source or '').strip().lower() == 'fork':
         recovered['_fork_child_turn'] = session.session_id
-    stamp_message_source(recovered, pending_source)
+    # The recovered row carries this stream's active-turn token so every
+    # downstream dedup can prove ownership by identity instead of by
+    # content + integer-second timestamp (re-gate 2026-10-06 item 3).
+    stamp_message_source(recovered, pending_source, active_turn_token=active_turn_token)
     if pending_attachments:
         recovered['attachments'] = pending_attachments
     session.messages.append(recovered)
@@ -16160,7 +16182,21 @@ def cancel_stream(stream_id: str) -> bool:
                             if isinstance(_last_content, str) and _last_ts >= _pending_started:
                                 # Tolerate the workspace prefix the streaming thread prepends.
                                 if _pending_user == _last_content or _pending_user in _last_content:
-                                    _already_persisted = True
+                                    _row_token = _last_user.get('_active_turn_token')
+                                    if (
+                                        _cancel_turn_token
+                                        and _row_token
+                                        and _row_token != _cancel_turn_token
+                                    ):
+                                        # Content + recency is not turn ownership (re-gate
+                                        # 2026-10-06 item 3): a second interrupt of the same
+                                        # prompt inside one second must synthesize its OWN
+                                        # row (with its own token), not bind this turn's
+                                        # cancel identity to the previous interrupt's row.
+                                        # Token-less rows keep the established check.
+                                        _already_persisted = False
+                                    else:
+                                        _already_persisted = True
                         if _already_persisted:
                             _cancel_turn_start = _last_user_idx
                         else:
