@@ -1245,6 +1245,134 @@ class ReconciliationHarness(unittest.TestCase):
             f"a session with copied rows must not get the sentinel: {json.dumps(fork_body)}",
         )
 
+    # ── Round-5 re-gate (2026-10-12 09:01 UTC, 29913f2e5): empty-context
+    # ── shapes in the gateway-side settle lane ───────────────────────────────
+
+    def test_17_empty_context_gateway_cancel_keeps_question_with_partial(self):
+        """Item 1: the gateway-side settle must reconcile BEFORE the display insert.
+
+        context_messages is EMPTY while session.messages holds the prior
+        conversation with an older unanswered prompt (A-old). The settle used
+        to insert the display partial into session.messages BEFORE
+        _reconcile_gateway_cancelled_context ran, so with an empty context
+        the reconcile seeded itself from the transcript projection INCLUDING
+        that partial: the recovered qB then sat BEFORE an assistant tail,
+        the partial-append guard saw no owning-prompt tail (so the seeded
+        `_recovered` flag was never cleared), and the admission builder's
+        answered-turn rule dropped qB — the partial stayed behind and
+        appeared to answer A-old. Master sends NO history for this shape
+        (the gateway uses its own transcript), so the regression was
+        strictly worse than master.
+        """
+        from api.gateway_chat import _settle_gateway_cancelled_turn
+
+        session = make_session("empty-ctx-cancel", [], messages=[
+            {"role": "user", "content": "u0"},
+            {"role": "assistant", "content": "a0"},
+            {"role": "user", "content": "A-old"},
+        ])
+        # Imported/legacy shape: empty model-facing context, full transcript.
+        session.context_messages = []
+        session.save()
+
+        stream_id = "stream-empty-cancel"
+        set_mid_turn_stream_state(session, stream_id, partial="B partial", prompt="qB")
+
+        # Gateway-side cancel: the worker settles the cancelled turn itself
+        # (status lane — no browser Stop through cancel_stream()).
+        _settle_gateway_cancelled_turn(session.session_id, stream_id)
+
+        body = admit_run(session.session_id, msg_text="q2")
+
+        self.assertEqual(
+            history_rows(body),
+            [
+                ("user", "u0"),
+                ("assistant", "a0"),
+                ("user", "A-old"),
+                ("user", "qB"),
+                ("assistant", "B partial"),
+            ],
+            "an empty-context gateway-side cancel must keep qB next to its "
+            f"own partial, got {history_rows(body)}",
+        )
+        self.assertEqual(body.get("input"), "q2")
+        teardown_stream_state(stream_id)
+
+    def test_18_projected_rows_keep_active_turn_token(self):
+        """Item 2: the empty-context seed must not strip `_active_turn_token`.
+
+        _project_transcript_context_rows dropped each user row's
+        `_active_turn_token`, so the FIRST empty-context interrupt seeded a
+        token-less prompt row into the model context. The SECOND interrupt of
+        the same prompt inside the same wall second then hit the token-less
+        fallback in the mirror dedup (content + int-second match) and was
+        treated as the first turn: only one prompt/partial pair was mirrored
+        and the next admission carried one turn where master carries both.
+        """
+        from api.gateway_chat import _settle_gateway_cancelled_turn
+        from api.process_event_utils import build_active_turn_token
+
+        session = make_session("empty-twice", [], messages=[
+            {"role": "user", "content": "u0"},
+            {"role": "assistant", "content": "a0"},
+        ])
+        session.context_messages = []
+        session.save()
+        fixed_started = 1790000000.5  # both interrupts share one wall second
+
+        stream_1 = "stream-empty-twice-1"
+        set_mid_turn_stream_state(session, stream_1, partial="P partial one", prompt="P")
+        session.pending_started_at = fixed_started
+        session.save()
+        _settle_gateway_cancelled_turn(session.session_id, stream_1)
+
+        stream_2 = "stream-empty-twice-2"
+        # Re-resolve the session the way the next turn's route does; stale
+        # handles must never be re-armed (same pattern as test_15).
+        session = get_session(session.session_id)
+        set_mid_turn_stream_state(session, stream_2, partial="P partial two", prompt="P")
+        session.pending_started_at = fixed_started
+        session.save()
+        _settle_gateway_cancelled_turn(session.session_id, stream_2)
+
+        ctx = get_session(session.session_id).context_messages
+        expected_ctx_shapes = [
+            ("user", "u0"),
+            ("assistant", "a0"),
+            ("user", "P"),
+            ("assistant", "P partial one"),
+            ("user", "P"),
+            ("assistant", "P partial two"),
+        ]
+        self.assertEqual(
+            [(row.get("role"), row.get("content")) for row in ctx],
+            expected_ctx_shapes,
+            "two gateway-side interrupts of the same prompt inside one "
+            f"second must stay two distinct turns, got {ctx}",
+        )
+        p_tokens = [
+            row.get("_active_turn_token") for row in ctx
+            if row.get("role") == "user" and row.get("content") == "P"
+        ]
+        self.assertEqual(
+            p_tokens,
+            [
+                build_active_turn_token(stream_1, fixed_started),
+                build_active_turn_token(stream_2, fixed_started),
+            ],
+            f"projected seed rows must keep each stream-bound token, got {p_tokens}",
+        )
+
+        body = admit_run(session.session_id, msg_text="q2")
+        self.assertEqual(
+            history_rows(body),
+            expected_ctx_shapes,
+            f"next admission must carry both interrupted turns, got {history_rows(body)}",
+        )
+        teardown_stream_state(stream_1)
+        teardown_stream_state(stream_2)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

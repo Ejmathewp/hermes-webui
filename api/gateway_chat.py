@@ -1909,6 +1909,33 @@ def _settle_gateway_cancelled_turn(session_id, stream_id) -> None:
         # NOTE: the pending identity fields are cleared AFTER the reconcile
         # materialize idempotent (no duplicate user row).
         _materialize_pending_user_turn_before_error(session)
+        # Reconcile BEFORE any downstream row-shuffling — including the
+        # display partial insert below (maintainer re-gate 2026-10-12 09:01
+        # UTC item 1). With an EMPTY context the reconcile seeds itself from
+        # the transcript projection, so a display partial already sitting in
+        # session.messages was projected into the seeded context BEFORE the
+        # recovered prompt: the seeded `_recovered` row then sat before an
+        # assistant tail, the partial-append guard saw no owning-prompt tail
+        # (the seeded `_recovered` flag was never cleared), and the
+        # admission builder's answered-turn rule dropped the prompt while
+        # its partial appeared to answer an older unanswered turn. Seeding
+        # while the transcript still ends with the owning prompt lets the
+        # `_recovered`-flag clear / partial append see it. This keeps the
+        # round-3 ordering contract — the reconcile needs the pending turn
+        # identity (pending_user_message / pending_started_at) to mirror the
+        # interrupted turn (prompt + streamed partial) into the model-facing
+        # context; the status-lane materialization above does NOT clear that
+        # identity (only _persist_cancelled_turn below does), so this
+        # ordering holds for both cancellation lanes — and extends it: the
+        # reconcile must precede the DISPLAY insert too. partial_ts shares
+        # the display partial's whole-second stamp (re-gate item 5) so the
+        # display merge key cannot insert a second copy of the partial on
+        # the next successful turn.
+        _reconcile_gateway_cancelled_context(
+            session,
+            stream_id,
+            partial_ts=partial_msg.get("timestamp") if partial_msg is not None else None,
+        )
         if partial_msg is not None:
             if not isinstance(session.messages, list):
                 session.messages = []
@@ -1930,21 +1957,6 @@ def _settle_gateway_cancelled_turn(session_id, stream_id) -> None:
                     break
             if not _partial_marker_already_present(session.messages, partial_msg, before_idx=marker_idx):
                 session.messages.insert(marker_idx, partial_msg)
-        # Reconcile BEFORE _persist_cancelled_turn (re-gate 2026-10-05
-        # item 2, kept across the #7978 composition): the reconcile needs
-        # the pending turn identity (pending_user_message /
-        # pending_started_at) to materialize the interrupted prompt into
-        # the model-facing context and to prove the streamed partial
-        # belongs to THAT turn. Persisting first cleared the identity, so
-        # the partial-append guard could only see "any trailing user row"
-        # and a queued prompt's partial landed under an older unanswered
-        # prompt. The status-lane materialization above does NOT clear the
-        # pending identity (only _persist_cancelled_turn does), so this
-        # ordering holds for both cancellation lanes: mirror the
-        # interrupted turn (prompt + streamed partial) into the
-        # model-facing context while the identity is still live, then
-        # persist the cancellation exactly once.
-        _reconcile_gateway_cancelled_context(session, stream_id)
         # Identity cleared only NOW: the reconcile above consumed
         # pending_user_message / pending_started_at as the turn identity.
         session.pending_user_message = None
@@ -1975,9 +1987,12 @@ def _project_transcript_context_rows(messages) -> list:
     The same row filters the runs-API history builder applies: error markers,
     empty partials, reasoning-only assistant rows, and non user/assistant
     roles never seed the model context. ``_recovered`` flags are KEPT so the
-    builder's answered-turn rule still decides visibility at send time, and
+    builder's answered-turn rule still decides visibility at send time,
     timestamps are preserved verbatim so transcript merges recognize the rows
-    as the same ones. Used to seed an EMPTY context_messages from
+    as the same ones, and each user row's ``_active_turn_token`` is KEPT so
+    same-second interrupts of one prompt stay distinguishable after the seed
+    (a token-less seeded row collapses the next interrupt into the content +
+    int-second fallback). Used to seed an EMPTY context_messages from
     session.messages (imported CLI sessions, first gateway turns cancelled
     gateway-side) before the interrupted turn is appended.
     """
@@ -2005,6 +2020,18 @@ def _project_transcript_context_rows(messages) -> list:
             row["timestamp"] = ts
         if entry.get("_recovered"):
             row["_recovered"] = True
+        row_token = entry.get("_active_turn_token")
+        if row_token:
+            # Turn identity survives the projection (maintainer re-gate
+            # 2026-10-12 09:01 UTC item 2): a second interrupt of the same
+            # prompt inside one wall second is distinguishable from the
+            # first only by its stream-bound token, and a token-less seeded
+            # row makes the mirror dedup fall back to content + int-second
+            # and swallow the second turn. Tokens are stream-scoped
+            # (stream_id:started_at), never session-scoped, so a preserved
+            # token can only ever match the exact stream that created it —
+            # there is no fork boundary where stripping it is required.
+            row["_active_turn_token"] = str(row_token)
         rows.append(row)
     return rows
 
