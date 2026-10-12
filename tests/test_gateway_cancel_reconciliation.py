@@ -1130,6 +1130,121 @@ class ReconciliationHarness(unittest.TestCase):
             f"next admission must carry both interrupted turns, got {history_rows(body)}",
         )
 
+    def test_16_cleared_session_sends_sentinel_not_stored_transcript(self):
+        """#8166 Greptile (2026-10-08): /clear must survive the admission gap.
+
+        /api/session/clear wipes messages + context_messages and stamps the
+        0.0 truncate-to-empty watermark — but the Gateway keeps its own
+        stored transcript. The next NORMAL (non-regen) turn reaches the
+        history builder with an empty context (deferred mode commits the new
+        prompt only after the run), so no active-row exclusion fires and the
+        conversation_history key was OMITTED — the admission handler then
+        fell back to its stored transcript and every pre-clear turn
+        resurrected into model context. ANY deliberately-empty webui
+        history must carry the system-only sentinel. The fake's store holds
+        pre-clear marker turns: if the fallback consults them they show up
+        in the composed answer and the saved context and the assertions
+        fail.
+        """
+        session = make_session("cleared", [], messages=[])
+        session.truncation_watermark = 0.0
+        session.save()
+
+        GATEWAY_STORE[session.session_id] = [
+            {"role": "user", "content": "pre-clear-q"},
+            {"role": "assistant", "content": "pre-clear-a"},
+        ]
+
+        body = admit_run(session.session_id, msg_text="fresh question")
+
+        self.assertEqual(
+            body.get("conversation_history"),
+            [{"role": "system", "content": "No earlier conversation turns."}],
+            "a cleared session's normal turn must send the system-only "
+            f"sentinel, got {body.get('conversation_history')}",
+        )
+        self.assertEqual(body.get("input"), "fresh question")
+        flat = json.dumps(body)
+        self.assertNotIn("pre-clear", flat, f"pre-clear marker resurrected into the body: {flat}")
+
+        # Full worker with the gateway's admission fallback applied: the
+        # composed answer proves the stored transcript was NOT consulted.
+        # Arm the stream the chat-start route does (active_stream_id + pending
+        # fields; deferred mode touches no context rows) so the success
+        # writeback is current for this stream.
+        from api.routes import _prepare_chat_start_session_for_stream
+
+        stream_id = "stream-cleared-wb"
+        fresh = get_session(session.session_id)
+        _prepare_chat_start_session_for_stream(
+            fresh,
+            msg="fresh question",
+            attachments=[],
+            workspace="/tmp",
+            model="test-model",
+            model_provider="",
+            stream_id=stream_id,
+            source="webui",
+            defer_save=True,
+        )
+        fresh.save()
+        with self._gateway_worker_env():
+            self._drive_full_worker_with_gateway_fallback(
+                session.session_id, "fresh question", stream_id,
+            )
+        self.assertEqual(
+            CAPTURED_BODIES[0].get("conversation_history"),
+            [{"role": "system", "content": "No earlier conversation turns."}],
+            f"the worker's admission must carry the sentinel too, got "
+            f"{CAPTURED_BODIES[0].get('conversation_history')}",
+        )
+        saved = get_session(session.session_id)
+        ctx = saved.context_messages
+        assistant_rows = [
+            row.get("content") for row in ctx
+            if isinstance(row, dict) and row.get("role") == "assistant"
+        ]
+        self.assertEqual(
+            assistant_rows,
+            ["turn answer"],
+            f"the answer must be composed over the SENTINEL, not the "
+            f"gateway's pre-clear transcript, got {assistant_rows}",
+        )
+        flat = json.dumps(ctx)
+        self.assertNotIn("pre-clear-q", flat, f"pre-clear prompt resurrected into saved context: {flat}")
+        self.assertNotIn("pre-clear-a", flat, f"pre-clear answer resurrected into saved context: {flat}")
+        self.assertNotIn(
+            "No earlier conversation turns.", flat,
+            f"the sentinel is transport-only and must never be saved: {flat}",
+        )
+        teardown_stream_state(stream_id)
+
+        # Control: a FORKED session carries COPIED context rows, so its
+        # history rides the normal path — no sentinel, no fallback.
+        parent = make_session("cleared-parent", [
+            {"role": "user", "content": "copied-u"},
+            {"role": "assistant", "content": "copied-a"},
+        ])
+        status, ok, _bad = drive_route("/api/session/branch", {"session_id": parent.session_id})
+        self.assertEqual(status, 200, ok)
+        fork_id = ok["session_id"]
+        GATEWAY_STORE[fork_id] = [
+            {"role": "user", "content": "store-poison-u"},
+            {"role": "assistant", "content": "store-poison-a"},
+        ]
+        fork_body = admit_run(fork_id, msg_text="fork question")
+        self.assertEqual(
+            history_rows(fork_body),
+            [("user", "copied-u"), ("assistant", "copied-a")],
+            "copied fork rows must ride as history, got "
+            f"{history_rows(fork_body)}",
+        )
+        self.assertEqual(fork_body.get("input"), "fork question")
+        self.assertNotIn(
+            "No earlier conversation turns.", json.dumps(fork_body),
+            f"a session with copied rows must not get the sentinel: {json.dumps(fork_body)}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
