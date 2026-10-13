@@ -1016,15 +1016,17 @@ def _run_gateway_runs_api_streaming(
         # that same interrupted turn is dropped with it.
         active_turn_identity = _active_turn_authority(session, stream_id, msg_text)
         drop_reconciled_partial = False
-        # Set when the outbound history is EMPTY on purpose: either the token
-        # match excluded the retained active-turn user row (it rides as
-        # `input` alone), or the session context itself is empty — e.g. a
-        # freshly cleared session, whose deferred-mode turn commits the new
-        # prompt only after the run. An absent (or empty) key makes the
-        # Gateway admission handler fall back to its own stored transcript,
-        # which reloads turns the user just deleted (re-gate 2026-10-06 item
-        # 2; #8166 Greptile 2026-10-08: /clear leaves the gateway store
-        # intact, so its pre-clear transcript resurrected wholesale).
+        # Set when the outbound history is EMPTY ON PURPOSE and the webui
+        # KNOWS it: either the token match excluded the retained active-turn
+        # user row (it rides as `input` alone), context_messages had rows
+        # that were all filtered away, or the session was cleared (messages
+        # empty AND the /clear truncate-to-empty watermark stamped; a
+        # deferred-mode turn commits the new prompt only after the run). An
+        # absent (or empty) key makes the Gateway admission handler fall back
+        # to its own stored transcript, which reloads turns the user just
+        # deleted (re-gate 2026-10-06 item 2; #8166 Greptile 2026-10-08:
+        # /clear leaves the gateway store intact, so its pre-clear transcript
+        # resurrected wholesale).
         active_row_excluded = False
         for entry in getattr(session, "context_messages", None) or []:
             if not isinstance(entry, dict):
@@ -1089,17 +1091,36 @@ def _run_gateway_runs_api_streaming(
             run_body["instructions"] = "\n\n".join(part for part in instructions_parts if part)
         if conversation_history:
             run_body["conversation_history"] = conversation_history
-        elif active_row_excluded or not conversation_history:
-            # The outbound history is empty ON PURPOSE — either the retained
-            # active-turn row was excluded and nothing else survived the
-            # filters, or the session context itself is empty (cleared or
-            # brand-new session; a deferred-mode first turn commits its
-            # prompt only after the run). Keep the key non-empty with a
-            # system-only sentinel so the admission handler takes this body
-            # as-is instead of falling back to its stored transcript and
-            # resurrecting deleted turns (re-gate 2026-10-06 item 2;
-            # #8166 Greptile 2026-10-08: /clear leaves the gateway store
-            # intact, so its pre-clear transcript resurrected wholesale).
+        elif (
+            active_row_excluded
+            or bool(getattr(session, "context_messages", None))
+            or (
+                not getattr(session, "messages", None)
+                and getattr(session, "truncation_watermark", None) is not None
+            )
+        ):
+            # The outbound history is empty ON PURPOSE and the webui KNOWS
+            # it: the retained active-turn row was excluded and nothing else
+            # survived the filters (regenerate), context_messages HAD rows
+            # that were all filtered away, or the session was cleared
+            # (messages empty AND the /clear truncate-to-empty watermark
+            # stamped — api/routes.py /api/session/clear). Keep the key
+            # non-empty with a system-only sentinel so the admission handler
+            # takes this body as-is instead of falling back to its stored
+            # transcript and resurrecting deleted turns (re-gate 2026-10-06
+            # item 2; #8166 Greptile 2026-10-08: /clear leaves the gateway
+            # store intact, so its pre-clear transcript resurrected
+            # wholesale).
+            # Any other empty-history shape OMITS the key so the admission
+            # handler falls back to its own stored transcript exactly as on
+            # master: a brand-new session's first deferred-mode turn
+            # (messages empty, context empty, NO watermark) and an imported
+            # CLI/legacy session (messages populated, context empty).
+            # api/gateway_chat.py 73955fec fired the sentinel for EVERY
+            # empty outbound history — the Anthropic-native converter keeps
+            # the LAST system row, so the sentinel silently replaced the
+            # cached prompt + WebUI instructions, and imported sessions ran
+            # blind (re-gate 2026-10-12 14:04 UTC).
             # The prompt travels in `input` only.
             run_body["conversation_history"] = [
                 {"role": "system", "content": "No earlier conversation turns."}

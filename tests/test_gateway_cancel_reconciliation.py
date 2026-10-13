@@ -1373,6 +1373,139 @@ class ReconciliationHarness(unittest.TestCase):
         teardown_stream_state(stream_1)
         teardown_stream_state(stream_2)
 
+    # ── Round-6 re-gate (2026-10-12 14:04 UTC): sentinel scope — only a
+    # ── deliberately emptied history carries the sentinel ───────────────────
+
+    def test_19_imported_session_empty_context_omits_key_gateway_loads_store(self):
+        """Round-6 must-fix: imported CLI/legacy sessions keep the fallback.
+
+        import_cli_session creates sessions with messages populated but
+        context_messages EMPTY (api/models.py import_cli_session). Master
+        omits conversation_history, so the Gateway admission handler loads
+        the SessionDB transcript and the first WebUI turn sees the imported
+        rows. The cleared-sessions sentinel (73955fec) fired for EVERY empty
+        outbound history — the `not conversation_history` clause is always
+        true inside the elif — so imported sessions ran blind behind a
+        system-only sentinel. This shape (messages populated, context empty,
+        no watermark) must OMIT the key so the gateway store fallback fires.
+        """
+        session = make_session(
+            "imported",
+            [],
+            messages=[
+                {"role": "user", "content": "remember mango"},
+                {"role": "assistant", "content": "mango acknowledged"},
+            ],
+        )
+        # The gateway's own store holds the imported transcript: what its
+        # admission handler loads when the body omits the key.
+        GATEWAY_STORE[session.session_id] = [
+            {"role": "user", "content": "remember mango"},
+            {"role": "assistant", "content": "mango acknowledged"},
+        ]
+
+        body = admit_run(session.session_id, msg_text="what fruit?")
+
+        self.assertNotIn(
+            "conversation_history",
+            body,
+            "an imported session (messages populated, context empty) must "
+            f"omit the key so the gateway loads its store, got "
+            f"{body.get('conversation_history')}",
+        )
+        self.assertEqual(body.get("input"), "what fruit?")
+        self.assertNotIn(
+            "No earlier conversation turns.",
+            json.dumps(body),
+            f"an imported session must not get the sentinel: {json.dumps(body)}",
+        )
+
+        # Full worker with the gateway's admission fallback applied: the
+        # composed answer proves the gateway loaded its stored mango rows —
+        # the first WebUI turn must not run blind.
+        from api.routes import _prepare_chat_start_session_for_stream
+
+        stream_id = "stream-imported-wb"
+        fresh = get_session(session.session_id)
+        _prepare_chat_start_session_for_stream(
+            fresh,
+            msg="what fruit?",
+            attachments=[],
+            workspace="/tmp",
+            model="test-model",
+            model_provider="",
+            stream_id=stream_id,
+            source="webui",
+            defer_save=True,
+        )
+        fresh.save()
+        with self._gateway_worker_env():
+            self._drive_full_worker_with_gateway_fallback(
+                session.session_id, "what fruit?", stream_id,
+            )
+        self.assertNotIn(
+            "conversation_history",
+            CAPTURED_BODIES[0],
+            f"the worker's admission must omit the key too, got "
+            f"{CAPTURED_BODIES[0].get('conversation_history')}",
+        )
+        saved = get_session(session.session_id)
+        ctx = saved.context_messages
+        assistant_rows = [
+            row.get("content") for row in ctx
+            if isinstance(row, dict) and row.get("role") == "assistant"
+        ]
+        self.assertEqual(
+            assistant_rows[-1],
+            "reloaded[remember mango|mango acknowledged]",
+            f"the LAST answer must be composed over the gateway's stored "
+            f"mango rows (fallback fired), got {assistant_rows}",
+        )
+        self.assertIn(
+            "mango acknowledged",
+            [str(row.get("content") or "") for row in ctx],
+            f"the imported mango rows must reach the model context via the "
+            f"gateway store fallback, got {ctx}",
+        )
+        flat = json.dumps(ctx)
+        self.assertNotIn(
+            "No earlier conversation turns.", flat,
+            f"the sentinel is transport-only and must never be saved: {flat}",
+        )
+        teardown_stream_state(stream_id)
+
+    def test_20_brand_new_session_omits_key_and_keeps_system_prompt(self):
+        """Round-6 must-fix: a brand-new session's first turn keeps master.
+
+        A NEW Gateway chat's first turn reaches the builder with messages
+        empty, context empty and NO truncation watermark (deferred mode
+        commits the prompt only after the run). The always-true
+        `not conversation_history` clause sent the system-only sentinel; the
+        agent seeded from it and prepended its own system row, and the
+        Anthropic-native converter keeps the LAST system row — so the cached
+        prompt + WebUI instructions were dropped on the wire. This shape
+        must OMIT the key (master parity) and carry no sentinel row at all,
+        so the agent's own system row is the only system row.
+        """
+        session = make_session("brand-new", [], messages=[])
+
+        body = admit_run(session.session_id, msg_text="first question")
+
+        self.assertNotIn(
+            "conversation_history",
+            body,
+            "a brand-new session (messages empty, context empty, no "
+            f"watermark) must omit the key, got "
+            f"{body.get('conversation_history')}",
+        )
+        self.assertEqual(body.get("input"), "first question")
+        self.assertNotIn(
+            "No earlier conversation turns.",
+            json.dumps(body),
+            "no sentinel row may precede the agent's own system row: "
+            f"{json.dumps(body)}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
