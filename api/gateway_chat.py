@@ -1019,9 +1019,11 @@ def _run_gateway_runs_api_streaming(
         # Set when the outbound history is EMPTY ON PURPOSE and the webui
         # KNOWS it: either the token match excluded the retained active-turn
         # user row (it rides as `input` alone), context_messages had rows
-        # that were all filtered away, or the session was cleared (messages
-        # empty AND the /clear truncate-to-empty watermark stamped; a
-        # deferred-mode turn commits the new prompt only after the run). An
+        # that were all filtered away, or the session was deliberately
+        # emptied (the 0.0 truncate-to-empty watermark stamped; a
+        # deferred-mode turn commits the new prompt only after the run,
+        # while eager mode checkpoints it into messages without advancing
+        # that watermark). An
         # absent (or empty) key makes the Gateway admission handler fall back
         # to its own stored transcript, which reloads turns the user just
         # deleted (re-gate 2026-10-06 item 2; #8166 Greptile 2026-10-08:
@@ -1094,36 +1096,41 @@ def _run_gateway_runs_api_streaming(
         elif (
             active_row_excluded
             or bool(getattr(session, "context_messages", None))
-            or (
-                not getattr(session, "messages", None)
-                and getattr(session, "truncation_watermark", None) is not None
-            )
+            # 0.0 is the truncate-to-empty sentinel every deliberate
+            # emptying stamps (/clear, retry, undo, truncate keep=0 via
+            # session_ops._truncation_watermark_for([])); the eager-mode
+            # chat-start checkpoint appends the NEW prompt to messages but
+            # never advances a 0.0 watermark, so this holds in both save
+            # modes. A brand-new or imported session has no watermark.
+            or getattr(session, "truncation_watermark", None) == 0.0
         ):
             # The outbound history is empty ON PURPOSE and the webui KNOWS
             # it: the retained active-turn row was excluded and nothing else
             # survived the filters (regenerate), context_messages HAD rows
-            # that were all filtered away, or the session was cleared
-            # (messages empty AND the /clear truncate-to-empty watermark
-            # stamped — api/routes.py /api/session/clear). Keep the key
-            # non-empty with a system-only sentinel so the admission handler
+            # that were all filtered away, or the session was deliberately
+            # emptied (0.0 truncate-to-empty watermark — /clear, retry,
+            # undo, truncate keep=0; api/routes.py /api/session/clear). Keep
+            # the key non-empty with a sentinel so the admission handler
             # takes this body as-is instead of falling back to its stored
             # transcript and resurrecting deleted turns (re-gate 2026-10-06
             # item 2; #8166 Greptile 2026-10-08: /clear leaves the gateway
             # store intact, so its pre-clear transcript resurrected
             # wholesale).
+            # The sentinel is a USER row: the Anthropic-native converter
+            # keeps the LAST system row, so a system sentinel replaced the
+            # cached prompt + WebUI instructions wholesale on every
+            # deliberate-empty lane (re-gate 2026-10-13 item 2).
             # Any other empty-history shape OMITS the key so the admission
             # handler falls back to its own stored transcript exactly as on
             # master: a brand-new session's first deferred-mode turn
             # (messages empty, context empty, NO watermark) and an imported
             # CLI/legacy session (messages populated, context empty).
-            # api/gateway_chat.py 73955fec fired the sentinel for EVERY
-            # empty outbound history — the Anthropic-native converter keeps
-            # the LAST system row, so the sentinel silently replaced the
-            # cached prompt + WebUI instructions, and imported sessions ran
-            # blind (re-gate 2026-10-12 14:04 UTC).
+            # api/gateway_chat.py 73955fec had fired the sentinel for EVERY
+            # empty outbound history, so imported sessions ran blind
+            # (re-gate 2026-10-12 14:04 UTC).
             # The prompt travels in `input` only.
             run_body["conversation_history"] = [
-                {"role": "system", "content": "No earlier conversation turns."}
+                {"role": "user", "content": "No earlier conversation turns."}
             ]
         update_active_run(stream_id, phase="gateway-request")
         # Persist the exact body first: a restart before the run id is saved replays this admission.

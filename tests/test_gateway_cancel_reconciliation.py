@@ -136,6 +136,36 @@ def _gateway_adopted_rows(body: dict) -> list:
     ]
 
 
+def _anthropic_native_converter_seam(body: dict) -> dict:
+    """Webui-side seam for the installed Agent's Anthropic converter.
+
+    anthropic_message_convert.py (~742) folds a /v1/runs body into provider
+    messages: the run's `instructions` and every `system` row of
+    conversation_history collapse into the provider system prompt keeping
+    only the LAST system row; user/assistant rows keep their order in
+    `messages` and the run's `input` is appended as the final user message
+    (the prompt travels in `input`, never duplicated into the history —
+    docs/advanced-chat-setup.md, api_server_runs.py ~712-714 admission
+    semantics mirrored by the fake gateway above).
+    """
+    system_rows = []
+    instructions = str(body.get("instructions") or "").strip()
+    if instructions:
+        system_rows.append(instructions)
+    messages = []
+    for row in body.get("conversation_history") or []:
+        if row.get("role") == "system":
+            system_rows.append(str(row.get("content") or ""))
+        else:
+            messages.append({"role": row.get("role"), "content": row.get("content")})
+    prompt = body.get("input")
+    if isinstance(prompt, list):
+        prompt = prompt[-1].get("content") if prompt else ""
+    if prompt:
+        messages.append({"role": "user", "content": prompt})
+    return {"system": system_rows[-1] if system_rows else "", "messages": messages}
+
+
 def fake_urlopen(req, *, timeout=None):
     url = req.full_url
     if url.endswith("/v1/runs"):
@@ -864,8 +894,8 @@ class ReconciliationHarness(unittest.TestCase):
         Excluding the retained active-turn user row empties the outbound
         history; dropping the conversation_history key (or sending []) makes
         the Gateway admission handler fall back to its stored transcript and
-        reload the deleted rows. The builder must send a non-empty
-        system-only sentinel instead, with the prompt only in `input`.
+        reload the deleted rows. The builder must send a non-empty sentinel
+        instead, with the prompt only in `input`.
         """
         from api.streaming import cancel_stream
 
@@ -898,9 +928,9 @@ class ReconciliationHarness(unittest.TestCase):
 
         self.assertEqual(
             body.get("conversation_history"),
-            [{"role": "system", "content": "No earlier conversation turns."}],
-            "an empty-by-exclusion history must send the system-only "
-            f"sentinel, got {body.get('conversation_history')}",
+            [{"role": "user", "content": "No earlier conversation turns."}],
+            "an empty-by-exclusion history must send the sentinel as a USER "
+            f"row, got {body.get('conversation_history')}",
         )
         self.assertEqual(body.get("input"), "u0")
         # The deleted interrupted turn must not ride anywhere in the body.
@@ -1141,7 +1171,7 @@ class ReconciliationHarness(unittest.TestCase):
         conversation_history key was OMITTED — the admission handler then
         fell back to its stored transcript and every pre-clear turn
         resurrected into model context. ANY deliberately-empty webui
-        history must carry the system-only sentinel. The fake's store holds
+        history must carry the sentinel. The fake's store holds
         pre-clear marker turns: if the fallback consults them they show up
         in the composed answer and the saved context and the assertions
         fail.
@@ -1159,9 +1189,9 @@ class ReconciliationHarness(unittest.TestCase):
 
         self.assertEqual(
             body.get("conversation_history"),
-            [{"role": "system", "content": "No earlier conversation turns."}],
-            "a cleared session's normal turn must send the system-only "
-            f"sentinel, got {body.get('conversation_history')}",
+            [{"role": "user", "content": "No earlier conversation turns."}],
+            "a cleared session's normal turn must send the sentinel as a "
+            f"USER row, got {body.get('conversation_history')}",
         )
         self.assertEqual(body.get("input"), "fresh question")
         flat = json.dumps(body)
@@ -1194,7 +1224,7 @@ class ReconciliationHarness(unittest.TestCase):
             )
         self.assertEqual(
             CAPTURED_BODIES[0].get("conversation_history"),
-            [{"role": "system", "content": "No earlier conversation turns."}],
+            [{"role": "user", "content": "No earlier conversation turns."}],
             f"the worker's admission must carry the sentinel too, got "
             f"{CAPTURED_BODIES[0].get('conversation_history')}",
         )
@@ -1244,6 +1274,113 @@ class ReconciliationHarness(unittest.TestCase):
             "No earlier conversation turns.", json.dumps(fork_body),
             f"a session with copied rows must not get the sentinel: {json.dumps(fork_body)}",
         )
+
+    def test_16b_cleared_session_sends_sentinel_in_eager_save_mode(self):
+        """Re-gate item 1 (2026-10-13): eager mode must not hide the /clear.
+
+        webui.session_save_mode=eager checkpoints the NEW prompt into
+        session.messages at chat start
+        (routes._checkpoint_user_message_for_eager_session_save) and its
+        watermark advance is guarded by `if getattr(s,
+        "truncation_watermark", None):` — falsy on 0.0, so a cleared
+        session keeps the 0.0 watermark while messages=[prompt]. The old
+        AND clause (`not messages and watermark is not None`) skipped that
+        shape, the conversation_history key was OMITTED, and the gateway
+        store fallback resurrected every pre-clear turn. `watermark == 0.0`
+        must fire in BOTH save modes.
+        """
+        session = make_session("cleared-eager", [], messages=[])
+        session.truncation_watermark = 0.0
+        session.save()
+
+        GATEWAY_STORE[session.session_id] = [
+            {"role": "user", "content": "pre-clear-q"},
+            {"role": "assistant", "content": "pre-clear-a"},
+        ]
+
+        # The eager chat-start checkpoint: the prompt lands in messages
+        # while the 0.0 watermark stays stamped (only a live watermark
+        # advances).
+        from api.routes import _prepare_chat_start_session_for_stream
+
+        stream_id = "stream-cleared-eager-wb"
+        fresh = get_session(session.session_id)
+        with patch.object(routes, "get_webui_session_save_mode", lambda: "eager"):
+            _prepare_chat_start_session_for_stream(
+                fresh,
+                msg="fresh question",
+                attachments=[],
+                workspace="/tmp",
+                model="test-model",
+                model_provider="",
+                stream_id=stream_id,
+                source="webui",
+                defer_save=True,
+            )
+        fresh.save()
+        eager = get_session(session.session_id)
+        self.assertEqual(
+            [(row.get("role"), row.get("content")) for row in eager.messages],
+            [("user", "fresh question")],
+            f"pinned eager shape: the prompt must be checkpointed into "
+            f"messages, got {eager.messages}",
+        )
+        self.assertEqual(
+            eager.truncation_watermark, 0.0,
+            f"the eager checkpoint must not advance the 0.0 watermark, got "
+            f"{eager.truncation_watermark}",
+        )
+        self.assertEqual(
+            eager.context_messages or [], [],
+            f"eager mode touches no context rows, got {eager.context_messages}",
+        )
+
+        body = admit_run(session.session_id, msg_text="fresh question")
+
+        self.assertEqual(
+            body.get("conversation_history"),
+            [{"role": "user", "content": "No earlier conversation turns."}],
+            "an eager-mode cleared session (prompt checkpointed into "
+            "messages, 0.0 watermark) must still send the sentinel as a "
+            f"USER row, got {body.get('conversation_history')}",
+        )
+        self.assertEqual(body.get("input"), "fresh question")
+        flat = json.dumps(body)
+        self.assertNotIn("pre-clear", flat, f"pre-clear marker resurrected into the body: {flat}")
+
+        # Full worker with the gateway's admission fallback applied: the
+        # composed answer proves the stored transcript was NOT consulted
+        # under the eager shape too.
+        with self._gateway_worker_env():
+            self._drive_full_worker_with_gateway_fallback(
+                session.session_id, "fresh question", stream_id,
+            )
+        self.assertEqual(
+            CAPTURED_BODIES[0].get("conversation_history"),
+            [{"role": "user", "content": "No earlier conversation turns."}],
+            f"the worker's admission must carry the sentinel too, got "
+            f"{CAPTURED_BODIES[0].get('conversation_history')}",
+        )
+        saved = get_session(session.session_id)
+        ctx = saved.context_messages
+        assistant_rows = [
+            row.get("content") for row in ctx
+            if isinstance(row, dict) and row.get("role") == "assistant"
+        ]
+        self.assertEqual(
+            assistant_rows,
+            ["turn answer"],
+            f"the answer must be composed over the SENTINEL, not the "
+            f"gateway's pre-clear transcript, got {assistant_rows}",
+        )
+        flat = json.dumps(ctx)
+        self.assertNotIn("pre-clear-q", flat, f"pre-clear prompt resurrected into saved context: {flat}")
+        self.assertNotIn("pre-clear-a", flat, f"pre-clear answer resurrected into saved context: {flat}")
+        self.assertNotIn(
+            "No earlier conversation turns.", flat,
+            f"the sentinel is transport-only and must never be saved: {flat}",
+        )
+        teardown_stream_state(stream_id)
 
     # ── Round-5 re-gate (2026-10-12 09:01 UTC, 29913f2e5): empty-context
     # ── shapes in the gateway-side settle lane ───────────────────────────────
@@ -1504,6 +1641,70 @@ class ReconciliationHarness(unittest.TestCase):
             json.dumps(body),
             "no sentinel row may precede the agent's own system row: "
             f"{json.dumps(body)}",
+        )
+
+    # ── Round-7 re-gate (2026-10-13 16:02 UTC): sentinel role ───────────────
+
+    def test_21_sentinel_is_user_role_and_system_prompt_survives(self):
+        """Re-gate item 2: the sentinel must not eat the Anthropic system prompt.
+
+        The installed Agent's Anthropic converter folds a run's system rows
+        into the provider system prompt keeping only the LAST one
+        (anthropic_message_convert.py ~742 — modeled by
+        _anthropic_native_converter_seam). A `system` sentinel therefore
+        replaced the ENTIRE system prompt — agent instructions + WebUI
+        context — with "No earlier conversation turns." on every
+        deliberate-empty lane (clear, retry-to-empty, undo-to-empty,
+        truncate-to-empty, first-turn regeneration). As a USER row the
+        converter leaves it in `messages` and the agent's system prompt
+        survives.
+
+        Also pins the observed admission shape the run-launch path accepts:
+        the sentinel is the ONLY conversation_history row, the prompt rides
+        `input` alone (never duplicated into the history), so the composed
+        provider tail is the sentinel user turn followed by the input user
+        turn — two consecutive user rows the Anthropic Messages API
+        combines into one turn rather than rejecting.
+        """
+        agent_instructions = "You are Hermes, the agent's cached system prompt."
+        session = make_session("cleared-sysprompt", [], messages=[])
+        session.truncation_watermark = 0.0
+        session.save()
+
+        GATEWAY_STORE[session.session_id] = [
+            {"role": "user", "content": "pre-clear-q"},
+            {"role": "assistant", "content": "pre-clear-a"},
+        ]
+
+        body = admit_run(
+            session.session_id, msg_text="fresh question",
+            prefill_messages=[{"role": "system", "content": agent_instructions}],
+        )
+
+        # The admitted shape: sentinel-only history, prompt only in `input`.
+        self.assertEqual(
+            history_rows(body),
+            [("user", "No earlier conversation turns.")],
+            "the sentinel must be the ONLY history row, sent as a USER row, "
+            f"got {history_rows(body)}",
+        )
+        self.assertEqual(body.get("input"), "fresh question")
+
+        composed = _anthropic_native_converter_seam(body)
+        self.assertEqual(
+            composed["system"],
+            agent_instructions,
+            "the converter must keep the AGENT's system prompt, got "
+            f"{composed['system']!r}",
+        )
+        self.assertEqual(
+            composed["messages"],
+            [
+                {"role": "user", "content": "No earlier conversation turns."},
+                {"role": "user", "content": "fresh question"},
+            ],
+            "the sentinel must appear exactly once, as a USER row, ahead of "
+            f"the input prompt turn, got {composed['messages']}",
         )
 
 
